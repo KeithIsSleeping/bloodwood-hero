@@ -210,8 +210,16 @@ public class BloodwoodHeroPlugin extends Plugin
 	private static final String KEY_HIGH_SCORE = "highScore";
 	private static final String KEY_BEST_COMBO = "bestCombo";
 
-	/** How often the round trip to the game server is re-measured. */
-	private static final int PING_PERIOD_SECONDS = 5;
+	/**
+	 * How often the round trip to the game server is re-measured.
+	 *
+	 * <p>Infrequent on purpose. The figure is only wanted while chopping, it barely moves
+	 * over a session, and the client has no shared ping service - the world hopper's
+	 * readings are package private, so every plugin that wants one measures its own. That
+	 * makes each of them another ICMP echo to the same host, and there is no reason for
+	 * this one to be frequent when a stale reading costs nothing.</p>
+	 */
+	private static final int PING_PERIOD_SECONDS = 30;
 
 	/**
 	 * The delay before a click reaches the wire, as a fraction of a tick.
@@ -458,6 +466,16 @@ public class BloodwoodHeroPlugin extends Plugin
 	 * <p>Written by a background task and read while drawing, so it is volatile.</p>
 	 */
 	private volatile int pingMillis = -1;
+
+	/**
+	 * Whether there are bloodwoods in the scene, for the ping thread to read.
+	 *
+	 * <p>Written on the client thread and read on the ping thread, so it is volatile. It
+	 * exists because the ping thread cannot ask the client directly: deciding whether to
+	 * measure means knowing what is in the scene, and the scene is not safe to read from
+	 * off the client thread.</p>
+	 */
+	private volatile boolean atBloodwoods;
 
 	/**
 	 * The plugin's own thread for measuring the round trip.
@@ -758,6 +776,7 @@ public class BloodwoodHeroPlugin extends Plugin
 		axeClickbox = null;
 		activeTree = null;
 		activeTreeIndex = -1;
+		atBloodwoods = false;
 		lastJudgement = null;
 		lastJudgementTick = -1;
 		callout = null;
@@ -1256,6 +1275,10 @@ public class BloodwoodHeroPlugin extends Plugin
 
 		updateAxeClickbox();
 
+		// Told to the ping thread here, on the tick, because that thread cannot look at
+		// the scene itself.
+		atBloodwoods = !treesById.isEmpty();
+
 		// Keep the reference fresh: trees respawn as they regrow, so the object captured
 		// at click time goes stale while the id it was found by does not.
 		if (activeTreeIndex >= 0)
@@ -1487,12 +1510,18 @@ public class BloodwoodHeroPlugin extends Plugin
 	/**
 	 * Measures the round trip to the world the player is on.
 	 *
-	 * <p>Run on the background scheduler because it touches the network, and guarded so
-	 * it costs nothing while the player is not at a bloodwood.</p>
+	 * <p>Only while there are bloodwoods in the scene. The window this feeds is of no use
+	 * anywhere else, and the client has no shared ping service - the world hopper's
+	 * readings are package private, so every plugin wanting one sends its own ICMP echo
+	 * to the same host. Pinging from a bank or while questing would be adding to that
+	 * traffic for a figure nothing is going to read.</p>
+	 *
+	 * <p>The last reading is kept when leaving, so walking away and coming back does not
+	 * start again from nothing.</p>
 	 */
 	private void measurePing()
 	{
-		if (client.getGameState() != GameState.LOGGED_IN)
+		if (!atBloodwoods || client.getGameState() != GameState.LOGGED_IN)
 		{
 			return;
 		}
