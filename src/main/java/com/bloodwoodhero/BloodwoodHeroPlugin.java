@@ -214,6 +214,21 @@ public class BloodwoodHeroPlugin extends Plugin
 	private static final int PING_PERIOD_SECONDS = 5;
 
 	/**
+	 * The delay before a click reaches the wire, as a fraction of a tick.
+	 *
+	 * <p>A ping measures the wire and nothing else. Before a click gets onto it the click
+	 * waits on the client: for the frame loop to notice the button went down, and for the
+	 * next outbound packet to carry it. That wait counts against the tick exactly as the
+	 * network does - the server cares when the click <em>arrives</em>, not when it was
+	 * pressed - so leaving it out made the window too generous by about this much, and
+	 * clicks in the last tenth of the drawn box were landing in the following tick.</p>
+	 *
+	 * <p>Not derived from ping, because it is not a property of the connection. It is the
+	 * client's own, and it does not shrink on a better one.</p>
+	 */
+	private static final double INPUT_LATENCY = 0.08;
+
+	/**
 	 * The window never shrinks past this.
 	 *
 	 * <p>Not a guess at the window, but a floor on what is worth drawing: a connection
@@ -1447,13 +1462,20 @@ public class BloodwoodHeroPlugin extends Plugin
 	 * inside the box and still fail, which is exactly what it felt like. Taking the
 	 * spacing off makes the box mean one thing again: a note inside it can be clicked,
 	 * and whatever has to follow that click will still fit.</p>
+	 *
+	 * <p>And the client's own delay in sending the click comes off as well. Writing the
+	 * whole thing out: a tick begins on the server at S and the client sees it one way
+	 * later, at S plus n. A click made t after that reaches the server at S plus t plus
+	 * L plus 2n - the client's delay, then the wire - so it is handled in that same tick
+	 * only while t is under T minus the round trip minus L. The round trip was being
+	 * taken off and L was not, which is why the bottom of the box still failed.</p>
 	 */
 	public double effectiveWindow()
 	{
 		int ping = pingMillis;
 		double usable = ping <= 0 ? 1 : 1 - ping / (double) tickLengthMillis();
 		return Math.max(MIN_WINDOW,
-			Math.min(1, usable - BloodwoodBeat.CLICK_SPACING));
+			Math.min(1, usable - BloodwoodBeat.CLICK_SPACING - INPUT_LATENCY));
 	}
 
 	/** The measured round trip, for display. Negative until the first measurement. */
