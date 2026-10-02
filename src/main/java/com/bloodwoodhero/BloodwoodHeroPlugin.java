@@ -90,8 +90,7 @@ import net.runelite.http.api.worlds.WorldResult;
 @PluginDescriptor(
 	name = "Bloodwood Hero",
 	description = "A falling-note rhythm track for the bloodwood chopping cycle",
-	tags = {"bloodwood", "woodcutting", "rhythm", "tick", "darkmeyer", "hero"},
-	enabledByDefault = false
+	tags = {"bloodwood", "woodcutting", "rhythm", "tick", "vampyrium", "sap"}
 )
 public class BloodwoodHeroPlugin extends Plugin
 {

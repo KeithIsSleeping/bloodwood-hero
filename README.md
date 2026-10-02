@@ -1,73 +1,76 @@
 # Bloodwood Hero
 
-A falling-note rhythm track for chopping bloodwood trees.
+A rhythm game overlay for chopping bloodwood trees. Falling notes, timing grades, combos, the lot.
 
 ![Bloodwood Hero in action](https://raw.githubusercontent.com/KeithIsSleeping/bloodwood-hero/master/preview.gif)
 
-Chopping a bloodwood is not ordinary woodcutting. Each chop is a two-tick cycle: on one
-tick you click your own character **twice** to pull the axe back, and on the next you
-click the tree once to chop. Both pull-back clicks have to land inside the same game
-tick, and if they do not, the game tells you to pull your axe back further and the cycle
-is lost.
+## Why this exists
 
-That is a rhythm. This plugin draws it as one.
+Bloodwood chopping isn't normal woodcutting. One chop takes two game ticks:
 
-## What it shows
+1. **Tick one:** click your own character *twice* to pull the axe back.
+2. **Tick two:** click the tree once to chop.
 
-**Two targets, side by side.** One sits on the axe clickbox, the other on the tree, and
-the second is placed level with the first rather than where the tree's own clickbox
-centre would put it. A bloodwood is tall, so following the cycle would otherwise mean
-dragging the mouse up and down between every click. Level targets make the whole cycle a
-left-right movement with nothing to aim at vertically.
+Both pull-back clicks have to land in the same tick. Miss that and the game tells you
+"you need to pull your axe back further", and the cycle is wasted.
 
-**Notes that fall into them,** one per click, spaced as the clicks themselves need to be
-spaced. A note inside the box can be clicked, and whatever has to follow that click will
-still fit — that is the one promise the box makes, and the window is sized so it holds.
+So it isn't a skill check on your account, it's a skill check on your hands. That's
+basically a rhythm game, so here's a rhythm game.
 
-**A grade for every chop.** Perfect, great or ok, from how close the click landed to the
-centre line, with a combo, a running score and a burst on the note as it is struck. Hit
-enough in a row and it will say so.
+## What you get
 
-**Sap counters on every tree.** How much is left, coloured so a tree that only needs one
-more tap reads differently from one that needs several, and labelled when a tree is
-waiting to be collected or is ready to chop again. Knowing which of the three to walk to
-is most of the work of running them all at once.
+**Two target boxes, side by side.** One sits on the axe clickbox on your character, the
+other sits on the tree. The tree box is drawn at the same height as the axe box, so your
+mouse only ever moves left and right. No dragging it up and down a very tall tree on
+every single click.
+
+**Falling notes.** One per click you need to make, dropping into those boxes.
+
+**A grade for every chop.** PERFECT, GREAT or OK, based on how close your click landed to
+the centre line. There's a combo counter, a running score, and a burst on the note when
+you connect.
+
+**Tree tracking.** Sap left in each tree, colour coded, plus labels for trees waiting to
+be collected or ready to chop again. Handy when you're juggling three trees and need to
+know which one to walk to.
+
+**A side panel** with your score, current combo, best combo, chops on this tree, and your
+timing window next to your ping.
 
 ## The timing window
 
-The usable part of a game tick is not the whole of it.
+You don't get the whole tick to click in. The click has to reach the server before the
+tick ends, so the usable slice is the tick, minus your ping, minus the small delay before
+the client actually sends the click, minus the gap the second pull-back click needs.
 
-A tick begins on the server, and your client sees it one trip later. A click you make
-does not go straight onto the wire either — it waits for the client to notice the button
-and for the next outbound packet to carry it. Put together, a click is handled in the
-tick you think you are clicking in only while it is made earlier than the round trip plus
-that delay before the tick ends.
-
-The pull-back needs two clicks rather than one, so the room the second needs comes off as
-well. What is left is the window, and that is what the box is drawn at.
-
-The plugin measures your ping and sizes the window from it rather than asking you to
-guess, and shows both figures in its panel so you can check one against the other.
+Rather than making you guess that number or drag a slider until it feels right, the
+plugin measures your real ping and sizes the window from it. It uses RuneLite's own world
+hopper ping utility, only checks while you're actually at the trees, and does it at most
+once every 30 seconds.
 
 ## Settings
 
-Lane colours, note lookahead, the grading bands, the sap counters, the ground pulse and
-the score panel can all be turned off or recoloured. Everything is on by default except
-showing the track while you are not chopping.
+Recolour the lanes, change how far ahead notes appear, and toggle the grading bands, sap
+counters, ground pulse and score panel. Everything is on by default except showing the
+track while you're not chopping.
 
 ## What it does not do
 
-This is a passive visual overlay. It does not click for you, does not generate or consume
-input, does not add, remove or reorder menu entries, and gives no combat, boss or prayer
-assistance. Every click is still yours to make and still yours to time — it only draws
-the rhythm that was always there.
+To stay inside Jagex's third party client rules:
+
+- It does not click for you.
+- It does not create, alter or block any mouse or keyboard input.
+- It does not add, remove or reorder right click menu options.
+- It gives no combat, boss or prayer help.
+
+You still make and time every click yourself. The plugin only draws on screen.
 
 ## Requirements
 
-Bloodwood trees need **The Blood Moon Rises**, 77 Woodcutting and an empty bucket. They
-are found on Vampyrium.
+Bloodwood trees need **The Blood Moon Rises**, **77 Woodcutting** and an empty bucket.
+They're on Vampyrium.
 
 ## Credits
 
-Bloodwood trees and Vampyrium are the work of Jagex. Ping measurement uses RuneLite's own
-`worldhopper` utility.
+Bloodwood trees and Vampyrium are Jagex's. Ping measurement uses RuneLite's own world
+hopper utility.
