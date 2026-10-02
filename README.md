@@ -30,8 +30,8 @@ enough in a row and it will say so.
 
 **Sap counters on every tree.** How much is left, coloured so a tree that only needs one
 more tap reads differently from one that needs several, and labelled when a tree is
-waiting to be collected or is ready to chop again. Knowing which of the six to walk to is
-most of the work of running three trees at once.
+waiting to be collected or is ready to chop again. Knowing which of the three to walk to
+is most of the work of running them all at once.
 
 ## The timing window
 
