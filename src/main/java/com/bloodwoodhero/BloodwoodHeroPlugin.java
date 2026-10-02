@@ -961,7 +961,18 @@ public class BloodwoodHeroPlugin extends Plugin
 			}
 
 			treeClicksThisTick++;
-			lastInteractionTick = client.getTickCount();
+			int tick = client.getTickCount();
+			lastInteractionTick = tick;
+
+			// The click that opens a tree opens its cycle, and a cycle opens with the
+			// pull-backs - you cannot chop an axe you have not drawn. Anchoring here puts
+			// the pull-back notes on the next tick and the chop on the one after, which
+			// is the order the game actually asks for.
+			if (beatIsStale(tick))
+			{
+				restartBeat(tick);
+			}
+
 			// Where in the tick the click fell, as a position within the part of the tick
 			// that actually registers rather than within the whole of it: 0 at the middle
 			// of that window and half a window at either edge.
@@ -1179,7 +1190,7 @@ public class BloodwoodHeroPlugin extends Plugin
 	}
 
 	/**
-	 * Starts the beat from a pull-back when no chop has landed yet.
+	 * Starts the beat from a pull-back when there is no live cycle to follow.
 	 *
 	 * <p>Without this nothing can be drawn until the first chop completes, which is the
 	 * one cycle a new player most needs drawn. A pull-back puts the chop on the tick
@@ -1188,10 +1199,45 @@ public class BloodwoodHeroPlugin extends Plugin
 	 */
 	private void anchorBeat(int tick)
 	{
-		if (beatAnchorTick < 0)
+		if (beatIsStale(tick))
 		{
 			beatAnchorTick = tick - config.cycleTicks() + 1;
 		}
+	}
+
+	/**
+	 * Starts the cycle over from the click that began it.
+	 *
+	 * <p>A cycle always opens with the pull-backs. You cannot chop an axe you have not
+	 * drawn, so the first thing a player needs to be shown on a fresh tree is the pair of
+	 * pull-back notes, and the chop a tick later.</p>
+	 *
+	 * <p>Anchoring on the click itself produces exactly that: the next tick falls off the
+	 * anchor and is a pull-back, and the one after it closes the cycle as a chop.</p>
+	 *
+	 * <p>Needed because the anchor outlives the tree it was set on. It is only replaced
+	 * by a landed chop or cleared by a scene reload, so walking to the next tree and
+	 * clicking it carried the old tree's parity across - and whether that opened on a
+	 * pull-back or on a chop came down to which tick the last tree happened to finish
+	 * on.</p>
+	 */
+	private void restartBeat(int tick)
+	{
+		beatAnchorTick = tick;
+	}
+
+	/**
+	 * Whether the beat describes a cycle that is actually running.
+	 *
+	 * <p>An anchor from a run that has already ended is worse than no anchor at all: it
+	 * is a confident statement about which tick is which, and it is wrong.</p>
+	 */
+	private boolean beatIsStale(int tick)
+	{
+		return beatAnchorTick < 0
+			|| resuming
+			|| lastChopTick < 0
+			|| tick - lastChopTick > IDLE_TICKS;
 	}
 
 	/** Remembers which tree is being worked, and which varbit therefore speaks for it. */
