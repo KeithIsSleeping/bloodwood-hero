@@ -2,7 +2,7 @@
 
 A falling-note rhythm track for chopping bloodwood trees.
 
-![Bloodwood Hero in action](preview.gif)
+![Bloodwood Hero in action](https://raw.githubusercontent.com/KeithIsSleeping/bloodwood-hero/master/preview.gif)
 
 Chopping a bloodwood is not ordinary woodcutting. Each chop is a two-tick cycle: on one
 tick you click your own character **twice** to pull the axe back, and on the next you
