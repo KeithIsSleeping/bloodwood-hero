@@ -2,7 +2,9 @@
 
 A rhythm game overlay for chopping bloodwood trees. Falling notes, timing grades, combos, the lot.
 
-![Bloodwood Hero in action](https://raw.githubusercontent.com/KeithIsSleeping/bloodwood-hero/master/preview.gif)
+![Bloodwood Hero](https://raw.githubusercontent.com/KeithIsSleeping/bloodwood-hero/master/screenshot.png)
+
+[See it in motion (animated)](https://raw.githubusercontent.com/KeithIsSleeping/bloodwood-hero/master/preview.gif)
 
 ## Why this exists
 
