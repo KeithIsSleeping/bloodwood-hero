@@ -151,6 +151,16 @@ public class BloodwoodHeroPlugin extends Plugin
 	private static final int TAP_YIELD = 25;
 
 	/**
+	 * How far a sap bar may be from a tree and still be that tree's.
+	 *
+	 * <p>A bar is drawn over the tree it belongs to, so this only has to allow for the
+	 * width of one. What it is really keeping out is the engorged bloodwood, which raises
+	 * a bar from the same NPC id and is not a tree this plugin has anything to say
+	 * about.</p>
+	 */
+	private static final int HEADBAR_MAX_DISTANCE = 2;
+
+	/**
 	 * How long a clicked tap has to show itself before the intention is dropped.
 	 *
 	 * <p>Long enough to walk the width of the clearing, short enough that a tree clicked
@@ -699,6 +709,16 @@ public class BloodwoodHeroPlugin extends Plugin
 		return index < 0 || index >= headbarTrees.size() ? -1 : headbarTrees.get(index);
 	}
 
+	/**
+	 * The tree a sap bar is standing on, or -1 if it is not standing on one of ours.
+	 *
+	 * <p>Bounded by distance rather than taking whichever tree is nearest. A bar belongs
+	 * to the tree it is drawn over, so one further away than a tree is wide belongs to
+	 * something else - and the engorged bloodwood has a bar of its own, drawn by the same
+	 * NPC id. Unbounded, that bar was being handed the sap figure of whichever real
+	 * bloodwood happened to be closest, and a tree nobody can chop in rhythm was being
+	 * given a counter telling them when to.</p>
+	 */
 	private int nearestTreeId(NPC headbar)
 	{
 		WorldPoint at = headbar.getWorldLocation();
@@ -724,7 +744,7 @@ public class BloodwoodHeroPlugin extends Plugin
 				bestId = entry.getKey();
 			}
 		}
-		return bestId;
+		return bestDistance <= HEADBAR_MAX_DISTANCE ? bestId : -1;
 	}
 
 	@Subscribe
@@ -1124,16 +1144,19 @@ public class BloodwoodHeroPlugin extends Plugin
 	 * 33393 is also a gem sack, 33396 is incendiary data - so taking such an item off the
 	 * floor was switching the active tree, resetting the chop count and dropping the
 	 * track in the middle of a run.</p>
+	 *
+	 * <p>Matched on the six ids and nothing else. There used to be a fallback onto any
+	 * target whose name contained "bloodwood", which sounds harmless and is not: the
+	 * engorged bloodwood tree is also called one. That tree is the slow alternative, cut
+	 * like ordinary wood with no axe to pull back and no cycle to keep, and the fallback
+	 * was raising the whole track over it. The ids are generated constants covering every
+	 * tree this plugin is for, so the fallback was adding a way to be wrong rather than a
+	 * way to cope.</p>
 	 */
 	private boolean isBloodwoodClick(MenuOptionClicked event)
 	{
-		if (!isObjectAction(event.getMenuAction()))
-		{
-			return false;
-		}
-
-		return BLOODWOOD_TREE_IDS.contains(event.getId())
-			|| Text.removeTags(event.getMenuTarget()).toLowerCase().contains("bloodwood");
+		return isObjectAction(event.getMenuAction())
+			&& BLOODWOOD_TREE_IDS.contains(event.getId());
 	}
 
 	/** Whether that click was asking to tap the tree for sap. */
