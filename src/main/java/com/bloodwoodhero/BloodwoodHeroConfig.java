@@ -196,6 +196,18 @@ public interface BloodwoodHeroConfig extends Config
 		return false;
 	}
 
+	@ConfigItem(
+		position = 5,
+		keyName = "showClickboxes",
+		name = "Show character and tree markers",
+		description = "Outline your character wherever it reaches outside the pull-back box, and mark where the other trees' boxes are. Your own model is part of what a pull-back click lands on, and it is the half that moves - swinging across the trunk and taking clicks meant for the wood, which otherwise looks like the chop box simply failing.",
+		section = trackSection
+	)
+	default boolean showClickboxes()
+	{
+		return true;
+	}
+
 	@Alpha
 	@ConfigItem(
 		position = 0,
@@ -239,26 +251,13 @@ public interface BloodwoodHeroConfig extends Config
 		position = 0,
 		keyName = "chopsPerTree",
 		name = "Chops per tree",
-		description = "How many chops a tree takes, used for the progress readout. Twenty-two is the usual figure; the count itself is read from the game rather than assumed, so this only labels it.",
+		description = "The figure used before the first chop of a session, after which it is replaced by what your axe actually does. The real number varies by axe - twenty-four on an adamant down to eighteen on a crystal felling axe - so it is counted rather than configured once there is anything to count.",
 		section = scoreSection
 	)
 	@Range(min = 1, max = 60)
 	default int chopsPerTree()
 	{
 		return 22;
-	}
-
-	@ConfigItem(
-		position = 1,
-		keyName = "cycleTicks",
-		name = "Ticks per chop",
-		description = "Length of one chop cycle in game ticks: one tick to pull the axe back and one to chop makes two. Only change this if you are using a different method.",
-		section = scoreSection
-	)
-	@Range(min = 2, max = 6)
-	default int cycleTicks()
-	{
-		return 2;
 	}
 
 	@ConfigItem(

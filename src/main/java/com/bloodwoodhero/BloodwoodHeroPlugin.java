@@ -46,7 +46,9 @@ import net.runelite.api.GameState;
 import net.runelite.api.MenuAction;
 import net.runelite.api.NPC;
 import net.runelite.api.Player;
+import net.runelite.api.Point;
 import net.runelite.api.WorldView;
+import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.AnimationChanged;
 import net.runelite.api.events.ChatMessage;
@@ -55,6 +57,7 @@ import net.runelite.api.events.GameObjectSpawned;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.api.events.NpcDespawned;
 import net.runelite.api.gameval.AnimationID;
 import net.runelite.api.gameval.NpcID;
 import net.runelite.api.gameval.ObjectID;
@@ -142,6 +145,9 @@ public class BloodwoodHeroPlugin extends Plugin
 	/** The bucket value that means it is full and waiting to be collected. */
 	private static final int BUCKET_FULL = 2;
 
+	/** How far from a tree's own tiles still counts as standing at it. */
+	private static final int ARRIVAL_DISTANCE = 2;
+
 	/**
 	 * How much sap one tap draws off a tree.
 	 *
@@ -149,6 +155,45 @@ public class BloodwoodHeroPlugin extends Plugin
 	 * the question the sap figure exists to answer.</p>
 	 */
 	private static final int TAP_YIELD = 25;
+
+	/**
+	 * How many ticks one chop cycle takes: a pull-back tick, then a chop tick.
+	 *
+	 * <p>Fixed, because the game fixes it. Chops land every second tick without
+	 * exception, so this was a setting that was correct at its default and wrong
+	 * everywhere else - and wrong quietly, since a longer cycle leaves the combo test
+	 * (<code>since == CYCLE_TICKS</code>) permanently unsatisfiable and the score stuck
+	 * at zero with nothing on screen to explain it.</p>
+	 */
+	private static final int CYCLE_TICKS = 2;
+
+	/**
+	 * How far the sap bar must fall before a tree will take another tap.
+	 *
+	 * <p>Measured: a tap started at eighty sap took another at seventy, and one started
+	 * at forty took another at thirty - ten drawn off in both cases. Ten of a tap's
+	 * twenty-five is forty per cent, so the wound closes with sixty per cent of the bar
+	 * still showing.</p>
+	 *
+	 * <p>Consistent with every refusal on record, which sat at sixty-seven per cent and
+	 * above and never below. It is a property of the wound rather than of the tree, which
+	 * is why the figure is the same whether the tree holds eighty sap or forty.</p>
+	 */
+	private static final double RETAP_BAR_THRESHOLD = 0.60;
+
+	/**
+	 * The progress a tree has to reach before it opens and starts to bleed.
+	 *
+	 * <p>Measured: the chopping varbit climbs in steps of roughly a hundred and seventy
+	 * and resets the moment it reaches three thousand eight hundred, with the last chop
+	 * clamped so it lands exactly there rather than overshooting.</p>
+	 *
+	 * <p>This is what makes the axe matter. The target is fixed, so an axe that adds more
+	 * per chop needs fewer chops - which is the whole of the published table, from
+	 * twenty-four on an adamant axe down to eighteen on a crystal felling axe, without
+	 * needing the table itself.</p>
+	 */
+	private static final int CHOP_PROGRESS_TARGET = 3800;
 
 	/**
 	 * How far a sap bar may be from a tree and still be that tree's.
@@ -258,6 +303,50 @@ public class BloodwoodHeroPlugin extends Plugin
 	private static final String PULL_BACK_FAILED = "pull your axe back";
 
 	/**
+	 * The game's complaint when the axe was drawn back and then held too long.
+	 *
+	 * <p>The other half of a failed chop, and a distinct message rather than a wording of
+	 * the same one: "you can't hold your axe back for that long" is the pull-back having
+	 * been done properly and the chop never coming, where {@link #PULL_BACK_FAILED} is
+	 * the chop coming with no pull-back behind it. Matching only the latter left this
+	 * case uncorrected.</p>
+	 *
+	 * <p>This is also what makes a late chop safe to accept on sight. There is a deadline
+	 * on holding the axe, but the game announces it rather than leaving it to be guessed
+	 * at, so the plugin can take every chop on trust and undo the ones it is told about
+	 * instead of inventing a tick count and being wrong at the edges.</p>
+	 *
+	 * <p>Matched on the middle of the sentence to avoid the apostrophe, which the game
+	 * writes as a typographic one.</p>
+	 */
+	private static final String HELD_TOO_LONG = "hold your axe back for that long";
+
+	/**
+	 * The game's own word that a tree is nearly out of sap.
+	 *
+	 * <p>Worth more than the arithmetic it replaces. The sap figure has to be compared
+	 * against what one tap draws off to guess whether another will be needed; this is the
+	 * game saying so outright, and it arrives whether or not the guess was close.</p>
+	 *
+	 * <p>Matched on "bled out", which is the distinctive part of "that tree has almost
+	 * bled out, you'll need to open a new wound once it's done".</p>
+	 */
+	private static final String TREE_ALMOST_EMPTY = "bled out";
+
+	/**
+	 * The game's answer when a tree is not ready to be tapped again.
+	 *
+	 * <p>"The wound on that tree doesn't need to be reopened yet." The click did nothing,
+	 * so it says nothing about the tree and must not be allowed to stand in for a tap
+	 * that never happened.</p>
+	 *
+	 * <p>Matched on "reopened" rather than "opened". The two differ by two letters and
+	 * the shorter one is not a substring of the longer, so the guess this replaces never
+	 * matched the sentence it was written for and the check had never once fired.</p>
+	 */
+	private static final String WOUND_NOT_NEEDED = "need to be reopened";
+
+	/**
 	 * Every axe's chopping animation, which is what marks the swing.
 	 *
 	 * <p>The same constants the woodcutting plugin lists, repeated because its own set is
@@ -316,6 +405,23 @@ public class BloodwoodHeroPlugin extends Plugin
 	private final int[] lastProgress = new int[CHOPPING_PROGRESS.length];
 
 	/**
+	 * Chops landed on each tree, counted rather than read off a varbit.
+	 *
+	 * <p>The chopping varbit is not a tally of chops. It is progress toward opening the
+	 * tree, climbing by about a hundred and seventy a chop until it reaches
+	 * {@link #CHOP_PROGRESS_TARGET} - which is why reading it as a count announced three
+	 * thousand one hundred and fifty chops out of twenty-two.</p>
+	 *
+	 * <p>Each rise in it is one chop, so counting the rises gives the figure the varbit
+	 * was wrongly being asked for.</p>
+	 */
+	private final int[] chopsDone = new int[CHOPPING_PROGRESS.length];
+
+	/** Running average of what one chop adds, which is how the axe shows itself. */
+	private long stepSum;
+	private int stepCount;
+
+	/**
 	 * The trees in the scene, by object id.
 	 *
 	 * <p>Kept so the tree whose varbit just advanced can be turned into something with a
@@ -335,6 +441,23 @@ public class BloodwoodHeroPlugin extends Plugin
 	/** The sap bars in the scene, refreshed each tick alongside the axe clickbox. */
 	private final List<NPC> headbars = new ArrayList<>();
 
+	/**
+	 * Each tree's pull-back clickbox, by tree object id.
+	 *
+	 * <p>The clickbox belongs to the tree it stands beside, not to the player. A pull-back
+	 * is drawn at one tree and spent at that tree: you cannot draw the axe back here, walk
+	 * over there and swing it. So there is one of these per tree being worked, and which
+	 * one you click says which tree you are working - the same thing a click on the trunk
+	 * says.</p>
+	 *
+	 * <p>This was previously resolved by matching the clickbox standing on the player's
+	 * own tile, which found the right one only while the player stood at the tree they
+	 * had last clicked. Clicking a different tree's clickbox then did nothing the plugin
+	 * could see, so the track stayed on the old tree while the player was certain they
+	 * had switched.</p>
+	 */
+	private final Map<Integer, NPC> clickboxByTree = new HashMap<>();
+
 	/** The tree each of those bars belongs to, by the same index. */
 	private final List<Integer> headbarTrees = new ArrayList<>();
 
@@ -344,6 +467,34 @@ public class BloodwoodHeroPlugin extends Plugin
 
 	/** Index of that tree in the varbit and object id arrays, or -1 when none is known. */
 	private int activeTreeIndex = -1;
+
+	/**
+	 * Whether the player moved this tick.
+	 *
+	 * <p>Chopping is done standing still, so moving means going somewhere, and going
+	 * somewhere means there is nothing worth drawing yet. This is what tells a walk apart
+	 * from a chop without having to guess what a click meant: which tree the player is at
+	 * is known exactly, and whether they are on their way elsewhere is known exactly, and
+	 * neither needs the other.</p>
+	 */
+	private boolean moving;
+
+	/** Where the player stood last tick, which is the only way to notice them moving. */
+	private WorldPoint lastPlayerPosition;
+
+	/**
+	 * The tree the player last asked to chop, as opposed to the one they are standing at.
+	 *
+	 * <p>Used only to decide whether to draw, never to decide where. Those are different
+	 * questions, and every attempt to answer both with one value went wrong the same way:
+	 * a click says what was wanted, the position says what is true, and drawing a target
+	 * from what was wanted puts it over a tree the player has not reached.</p>
+	 *
+	 * <p>As a gate it is safe, because its failure is silence. Asked for a tree and not
+	 * there yet, nothing is drawn. Asked for a tree and then gone elsewhere, nothing is
+	 * drawn until the next click says what is wanted now.</p>
+	 */
+	private int requestedTreeId = -1;
 
 	/** Tick the most recent chop landed on, which is what the scoring measures against. */
 	@Getter
@@ -373,6 +524,16 @@ public class BloodwoodHeroPlugin extends Plugin
 	private boolean chopIntent;
 
 	/**
+	 * Whether the track was up last tick, so that it going down can be noticed.
+	 *
+	 * <p>Stepping away from a tree ends the cycle: the axe is no longer drawn back, so
+	 * coming back needs a fresh pair exactly as the first chop of the tree did. Without
+	 * noticing the moment it ended, the old cadence was still there on return and the
+	 * track picked up mid-cycle on a rhythm the player was no longer keeping.</p>
+	 */
+	private boolean wasChopping;
+
+	/**
 	 * Trees whose running tap was clicked as their last one, by object id.
 	 *
 	 * <p>Held per tree rather than for the one being worked, because the question it
@@ -393,6 +554,11 @@ public class BloodwoodHeroPlugin extends Plugin
 	private int pendingTapBucket;
 	private int pendingTapTick;
 
+	/** The sap bar's reading when the pending tap was clicked, for calibrating the rule. */
+	private int pendingTapBarRatio = -1;
+	private int pendingTapBarScale = -1;
+	private int lastTapClickTree = -1;
+
 	/**
 	 * When and where in its tick each lane was last struck.
 	 *
@@ -411,13 +577,77 @@ public class BloodwoodHeroPlugin extends Plugin
 	private double chopHitAt;
 	private int chopHitClick;
 
+	/**
+	 * When each lane was last clicked with nothing to click.
+	 *
+	 * <p>Kept apart from the hits because it is the opposite event and wants the opposite
+	 * answer on screen. A click with no note under it used to light up as a hit, drawn at
+	 * wherever in the tick it happened to land, which read as the track flashing at
+	 * random rather than as the player having struck at nothing.</p>
+	 */
+	private long pullBackMissMillis = -1;
+	private long chopMissMillis = -1;
+
+	/** Where the last pull-back click landed on screen, and when. */
+	private int pullBackClickX;
+	private int pullBackClickY;
+	private long pullBackClickMillis = -1;
+
+	/**
+	 * What gets said when a chop click lands on the axe instead of the tree.
+	 *
+	 * <p>Every one of them names both halves of the mistake - what was hit and what was
+	 * wanted - because the message has to be read at a glance mid-rhythm and a joke that
+	 * leaves the player working out what happened is worse than no joke. Several of them
+	 * only so the same line does not wear out over a long trip.</p>
+	 */
+	private static final String[] WRONG_TARGET_SHOUTS = {
+		"THAT WAS THE AXE - CLICK THE TREE",
+		"THE TREE! NOT THE AXE!",
+		"WOOD, NOT STEEL!",
+		"YOUR AXE GOT IN THE WAY",
+		"SWUNG AT YOUR OWN AXE",
+		"AIM PAST THE AXE"};
+
+	/** The line picked for the last wrong-target click, held while it is on screen. */
+	private String wrongTargetShout;
+
+	/** The last one is excluded, so the same line never lands twice running. */
+	private String pickWrongTarget()
+	{
+		String choice;
+		do
+		{
+			choice = WRONG_TARGET_SHOUTS[random.nextInt(WRONG_TARGET_SHOUTS.length)];
+		}
+		while (choice.equals(wrongTargetShout));
+		return choice;
+	}
+
+	/** The line to show for the last wrong-target click. */
+	public String getWrongTargetShout()
+	{
+		return wrongTargetShout == null ? WRONG_TARGET_SHOUTS[0] : wrongTargetShout;
+	}
+
+	/**
+	 * Whether the last pull-back click landed inside the chop target.
+	 *
+	 * <p>Which means the player was aiming at the tree and hit the axe or their own
+	 * character instead. The two overlap while the axe swings across the trunk, and the
+	 * result - a pull-back when a chop was wanted - looks like the game ignoring the
+	 * click rather than like a different thing being clicked.</p>
+	 */
+	public boolean pullBackHitChopBox(java.awt.Rectangle chopBox, long withinMillis)
+	{
+		return chopBox != null && pullBackClickMillis > 0
+			&& System.currentTimeMillis() - pullBackClickMillis <= withinMillis
+			&& chopBox.contains(pullBackClickX, pullBackClickY);
+	}
+
 	// Wall-clock start of the current tick, and how long the last one ran for.
 	private long lastTickMillis;
 	private long measuredTickMillis = 600;
-
-	/** Chops into the current tree. */
-	@Getter
-	private int treeChops;
 
 	/**
 	 * The shout for the chop just landed, held until the next one replaces it.
@@ -525,6 +755,15 @@ public class BloodwoodHeroPlugin extends Plugin
 	/** Clicks made this tick, by what they were aimed at. */
 	private int selfClicksThisTick;
 	private int treeClicksThisTick;
+
+	/**
+	 * Notes struck this tick, as opposed to clicks made.
+	 *
+	 * <p>What says which notes are gone. A click that hit nothing takes no note with
+	 * it.</p>
+	 */
+	private int selfHitsThisTick;
+	private int treeHitsThisTick;
 
 	@Getter
 	private int selfClicksLastTick;
@@ -656,6 +895,7 @@ public class BloodwoodHeroPlugin extends Plugin
 	private void updateAxeClickbox()
 	{
 		axeClickbox = null;
+		clickboxByTree.clear();
 		headbars.clear();
 		headbarTrees.clear();
 
@@ -680,11 +920,16 @@ public class BloodwoodHeroPlugin extends Plugin
 				// cannot change between ticks - neither bars nor trees move.
 				headbarTrees.add(nearestTreeId(npc));
 			}
-			else if (npc.getId() == NpcID.PLAYER_AXE_CLICKBOX_VIS
-				&& axeClickbox == null && here != null
-				&& here.equals(npc.getWorldLocation()))
+			else if (npc.getId() == NpcID.PLAYER_AXE_CLICKBOX_VIS)
 			{
-				axeClickbox = npc;
+				// Tied to the tree it stands beside rather than to whoever is swinging
+				// it. Bounded the same way the sap bars are: one further off than a tree
+				// is wide belongs to a tree of its own, or to nothing of ours.
+				int treeId = nearestTreeId(npc);
+				if (treeId > 0)
+				{
+					clickboxByTree.put(treeId, npc);
+				}
 			}
 		}
 	}
@@ -693,6 +938,18 @@ public class BloodwoodHeroPlugin extends Plugin
 	public List<NPC> getHeadbars()
 	{
 		return headbars;
+	}
+
+	/** Each tree's pull-back clickbox, by tree object id. */
+	public Map<Integer, NPC> getClickboxByTree()
+	{
+		return clickboxByTree;
+	}
+
+	/** The trees in the scene, by object id. */
+	public Map<Integer, GameObject> getTreesById()
+	{
+		return treesById;
 	}
 
 	/**
@@ -781,14 +1038,21 @@ public class BloodwoodHeroPlugin extends Plugin
 		beatAnchorTick = -1;
 		lastInteractionTick = -1;
 		chopIntent = false;
+		wasChopping = false;
+		requestedTreeId = -1;
+		moving = false;
+		lastPlayerPosition = null;
 		finalTapClicked.clear();
 		pendingTapTree = -1;
 		pullBackHitMillis = -1;
 		chopHitMillis = -1;
-		treeChops = 0;
+		pullBackMissMillis = -1;
+		chopMissMillis = -1;
 		combo = 0;
 		selfClicksThisTick = 0;
 		treeClicksThisTick = 0;
+		selfHitsThisTick = 0;
+		treeHitsThisTick = 0;
 		selfClicksLastTick = 0;
 		treeClicksLastTick = 0;
 		treesById.clear();
@@ -840,6 +1104,55 @@ public class BloodwoodHeroPlugin extends Plugin
 	}
 
 	/**
+	 * How far into the current tree the wound is, read from the game.
+	 *
+	 * <p>Taken from the tree's own progress rather than from chops counted here. A count
+	 * kept by this plugin starts at nothing every time the active tree changes, which is
+	 * right for a combo - the rhythm is yours and starts again when you walk away - but
+	 * wrong for the tree, which does not forget what has already been done to it. Coming
+	 * back to a tree nineteen chops in and being told nineteen remained was that count
+	 * being asked a question it could not answer.</p>
+	 */
+	public int getTreeChops()
+	{
+		return activeTreeIndex < 0 ? 0 : chopsDone[activeTreeIndex];
+	}
+
+	/**
+	 * How many chops this tree still needs, worked out from the progress left to make.
+	 *
+	 * <p>The target is fixed and one chop is worth whatever this axe is worth, so the
+	 * remainder divides out - and because the step is measured rather than assumed, this
+	 * is right for any axe including the felling variants whose figures are not
+	 * published.</p>
+	 */
+	public int getChopsLeft()
+	{
+		if (activeTreeIndex < 0 || stepCount == 0)
+		{
+			return 0;
+		}
+
+		int remaining = CHOP_PROGRESS_TARGET
+			- client.getVarbitValue(CHOPPING_PROGRESS[activeTreeIndex]);
+		int step = (int) (stepSum / stepCount);
+		return remaining <= 0 || step <= 0 ? 0 : (remaining + step - 1) / step;
+	}
+
+	/**
+	 * How many chops a tree takes with the axe in hand.
+	 *
+	 * <p>Counted and calculated rather than configured: what has been done plus what is
+	 * left. The configured figure stands in only until a chop has been seen, since
+	 * nothing is known about the axe before then.</p>
+	 */
+	public int getChopsPerTree()
+	{
+		int total = getTreeChops() + getChopsLeft();
+		return total > 0 ? total : config.chopsPerTree();
+	}
+
+	/**
 	 * Picks what to shout for the chop just landed, or null to stay quiet.
 	 *
 	 * <p>Decided here rather than in the overlay because it is random, and the overlay
@@ -861,7 +1174,7 @@ public class BloodwoodHeroPlugin extends Plugin
 			return milestone;
 		}
 
-		int left = config.chopsPerTree() - treeChops;
+		int left = getChopsLeft();
 		if (left <= 0 || random.nextDouble() >= CHOPS_LEFT_CHANCE)
 		{
 			return null;
@@ -923,6 +1236,21 @@ public class BloodwoodHeroPlugin extends Plugin
 	{
 		if (isPullBackClick(event))
 		{
+			// Where the click actually landed. A pull-back inside the chop box is the
+			// player aiming at the wood and hitting the axe or their own character
+			// instead - the two overlap, and nothing on screen explained the result.
+			net.runelite.api.Point mouse = client.getMouseCanvasPosition();
+			if (mouse != null)
+			{
+				pullBackClickX = mouse.getX();
+				pullBackClickY = mouse.getY();
+				pullBackClickMillis = System.currentTimeMillis();
+				// Chosen here, on the click, and not in the overlay: the overlay draws
+				// many times a tick, and rolling there would run through the whole list
+				// in the time one of them was meant to be showing.
+				wrongTargetShout = pickWrongTarget();
+			}
+
 			selfClicksThisTick++;
 			double at = clickFraction();
 			// The FIRST click of the tick, because that is the one the window constrains:
@@ -932,27 +1260,67 @@ public class BloodwoodHeroPlugin extends Plugin
 			{
 				pullBackFraction = at;
 			}
-			// Only a click inside the window is a hit worth flashing. One made past the
-			// edge is the click the game is about to ignore, and congratulating it would
-			// be the overlay disagreeing with the game.
+
+			// The note this click is reaching for is the next one not already taken,
+			// which is counted in hits rather than in clicks. A click that strikes
+			// nothing must not move that on: the note it failed to hit is still there,
+			// still falling, and still the one the next click is aimed at.
+			int note = selfHitsThisTick;
+
+			// A click only strikes something if the tick had a note left for it. The lane
+			// has to be this tick's, and the beat has to still be asking for that note -
+			// a third stab at a pull-back that wants two is swinging at nothing, however
+			// well timed it is.
 			//
-			// Measured against this note rather than the first of the tick. The window is
+			// Before a beat exists the lane is pull-back on every tick, because that is
+			// what the overlay is drawing: two notes falling every tick, since the next
+			// thing the tree needs is a pull-back pair whenever the player gets to it.
+			// Grading has to agree with drawing or the two contradict each other - and
+			// reading the lane alone here deadlocked, since a missing beat made every
+			// primer click a miss, and only a hit pair can supply the missing beat.
+			boolean pullBackLane = !hasBeat()
+				|| beatAt(client.getTickCount()) == BloodwoodBeat.PULL_BACK;
+			boolean onNote = pullBackLane && note < BloodwoodBeat.PULL_BACK.getClicks();
+
+			// And it has to be inside the window. One made past the edge is the click the
+			// game is about to ignore, and congratulating it would be the overlay
+			// disagreeing with the game.
+			//
+			// Measured against that note rather than the first of the tick. The window is
 			// shortened by exactly the spacing so the second click has somewhere to land,
 			// so testing the second against the unshifted window rejects it over the very
 			// room that shortening reserved - while the overlay, which does offset by the
-			// note index, draws it inside the box and consumes it.
-			if (at - (selfClicksThisTick - 1) * BloodwoodBeat.CLICK_SPACING <= effectiveWindow())
+			// note index, draws it inside the box.
+			boolean inWindow = at - note * BloodwoodBeat.CLICK_SPACING <= effectiveWindow();
+
+			if (onNote && inWindow)
 			{
 				pullBackHitMillis = System.currentTimeMillis();
 				pullBackHitAt = burstFraction(at);
-				// Which of the tick's notes this click took. The second note is spaced
-				// above the first, so a burst that did not know which one it belonged to
-				// drew the second click on the first note's line - the one already struck
-				// and gone.
-				pullBackHitClick = selfClicksThisTick - 1;
+				// Which note this click took. They are spaced apart rather than stacked,
+				// so a burst that did not know which one it belonged to drew every click
+				// on the first note's line.
+				pullBackHitClick = note;
+				selfHitsThisTick++;
+
+				// The pair completing settles the cadence without having to wait for the
+				// chop to land. Two pull-backs inside a tick means the chop is the next
+				// tick - that is the rule the game plays by, not a guess about it - so
+				// the beat can be set from here and the chop note starts falling at once.
+				//
+				// Only when there is no beat yet. Mid-run the cadence is already known,
+				// and re-stating it on every pair would move the anchor about for no
+				// gain, which is what used to send the notes jumping.
+				if (!hasBeat() && selfHitsThisTick == BloodwoodBeat.PULL_BACK.getClicks())
+				{
+					beatAnchorTick = client.getTickCount() - CYCLE_TICKS + 1;
+				}
+			}
+			else
+			{
+				pullBackMissMillis = System.currentTimeMillis();
 			}
 			lastInteractionTick = client.getTickCount();
-			anchorBeat(client.getTickCount());
 		}
 		else if (isBloodwoodClick(event))
 		{
@@ -960,7 +1328,6 @@ public class BloodwoodHeroPlugin extends Plugin
 			// for. Tap and collect are not chops, but they do say which tree is being
 			// worked - and knowing that is what lets the stage gate drop the track
 			// immediately rather than leaving it up until the idle timer runs out.
-			setActiveTree(event.getId());
 
 			// Whether this is the tap that finishes the tree can only be known here: the
 			// option says a tap was asked for, and the sap figure still says how much was
@@ -974,6 +1341,30 @@ public class BloodwoodHeroPlugin extends Plugin
 			// tell them apart - once the action finishes the tree looks the same either
 			// way, so a collect counted as a chop and put the track back up.
 			chopIntent = isChopOption(event) && !isCollectReady(event.getId());
+
+			// Which tree was clicked, whatever the click was for. Every click on a
+			// bloodwood names one exactly, and that is a fact worth keeping whether it
+			// asked to chop, to tap or to collect.
+			//
+			// It used to be cleared for anything but a chop, which threw the one certain
+			// thing away and left the plugin guessing the tree from where the player was
+			// stood - and a guess has to be wrong sometimes. Collecting is the case that
+			// exposed it: it shares its menu option with chopping, so the request was
+			// dropped, and the chopping that carried straight on afterwards had nothing
+			// left naming the tree.
+			//
+			// Whether to draw is a separate question with its own answers: chopIntent
+			// below says whether this click was a chop, and the stage check in
+			// isChopping() says whether the tree wants chopping at all. Neither needs the
+			// identity blurred to do its job.
+			boolean switchedTree = event.getId() != requestedTreeId;
+			requestedTreeId = event.getId();
+
+			// Worked out now rather than on the next tick. The overlay draws many times
+			// between ticks, so leaving it until then meant every one of those frames
+			// drew the chop box on the tree this click just replaced.
+			resolveActiveTree();
+
 			if (!chopIntent)
 			{
 				return;
@@ -983,13 +1374,15 @@ public class BloodwoodHeroPlugin extends Plugin
 			int tick = client.getTickCount();
 			lastInteractionTick = tick;
 
-			// The click that opens a tree opens its cycle, and a cycle opens with the
-			// pull-backs - you cannot chop an axe you have not drawn. Anchoring here puts
-			// the pull-back notes on the next tick and the chop on the one after, which
-			// is the order the game actually asks for.
-			if (beatIsStale(tick))
+			// The track waits for a chop rather than guessing the beat from this click.
+			// A click only says a chop was asked for, not which tick it will land on, and
+			// a guess that turns out wrong has to correct itself the moment the real one
+			// arrives - which moves every note on screen at once. Nothing is drawn until
+			// the tree says a chop happened, and from then on the beat is only ever told
+			// what already did happen.
+			if (switchedTree)
 			{
-				restartBeat(tick);
+				beatAnchorTick = -1;
 			}
 
 			// Where in the tick the click fell, as a position within the part of the tick
@@ -999,11 +1392,30 @@ public class BloodwoodHeroPlugin extends Plugin
 			double chopAt = clickFraction();
 			pendingClickOffset = (chopAt - window / 2) / window;
 
-			if (chopAt <= window)
+			int note = treeHitsThisTick;
+			boolean onNote = beatAt(tick) == BloodwoodBeat.CHOP
+				&& note < BloodwoodBeat.CHOP.getClicks();
+
+			// No window on the chop, unlike the pull-back. The window exists because two
+			// pull-backs have to share one tick, so the first has to leave room for the
+			// second; a chop is a single click with nothing to make room for. Landing it
+			// late does not fail - the chop simply happens on the next tick instead, and
+			// the game takes it.
+			//
+			// So a late one is a hit, and the beat re-anchors to wherever the chop
+			// actually lands. Calling it a miss was the overlay marking the player wrong
+			// about something the game had just accepted, and then holding a cycle the
+			// player was no longer on.
+			if (onNote)
 			{
 				chopHitMillis = System.currentTimeMillis();
 				chopHitAt = burstFraction(chopAt);
-				chopHitClick = treeClicksThisTick - 1;
+				chopHitClick = note;
+				treeHitsThisTick++;
+			}
+			else
+			{
+				chopMissMillis = System.currentTimeMillis();
 			}
 		}
 	}
@@ -1034,13 +1446,15 @@ public class BloodwoodHeroPlugin extends Plugin
 	/**
 	 * How many of this tick's notes have already been struck.
 	 *
-	 * <p>Notes are consumed in order, which is all the player can do with them: the two
-	 * pull-back lines of a tick are the first and second click of that tick. The count is
-	 * enough to say which are gone without having to give each note an identity.</p>
+	 * <p>Counted in hits rather than in clicks. Clicks include the ones that struck
+	 * nothing, and a note that was missed has not been taken - it is still falling, and
+	 * still the one the next click is aimed at. Consuming it anyway made a stray click
+	 * look as though it had moved the remaining note, because what was left was drawn at
+	 * the second note's offset instead of the first's.</p>
 	 */
-	public int getClicksThisTick(BloodwoodBeat beat)
+	public int getHitsThisTick(BloodwoodBeat beat)
 	{
-		return beat == BloodwoodBeat.CHOP ? treeClicksThisTick : selfClicksThisTick;
+		return beat == BloodwoodBeat.CHOP ? treeHitsThisTick : selfHitsThisTick;
 	}
 
 	/**
@@ -1069,6 +1483,17 @@ public class BloodwoodHeroPlugin extends Plugin
 	public int hitClick(BloodwoodBeat beat)
 	{
 		return beat == BloodwoodBeat.CHOP ? chopHitClick : pullBackHitClick;
+	}
+
+	/** How long ago a lane was clicked with nothing to click, in ticks, or -1. */
+	public double missAge(BloodwoodBeat beat)
+	{
+		long at = beat == BloodwoodBeat.CHOP ? chopMissMillis : pullBackMissMillis;
+		if (at < 0)
+		{
+			return -1;
+		}
+		return (System.currentTimeMillis() - at) / (double) tickLengthMillis();
 	}
 
 	/**
@@ -1121,8 +1546,8 @@ public class BloodwoodHeroPlugin extends Plugin
 	 * people's clicks as yours: consuming your notes, firing your bursts and filling the
 	 * tick's click count with clicks you never made.</p>
 	 *
-	 * <p>Comparing against the tracked clickbox settles both at once, since that one was
-	 * already resolved by standing on your own position.</p>
+	 * <p>Comparing against the tracked clickboxes settles both at once, since those were
+	 * already resolved by the tree each stands beside.</p>
 	 */
 	private boolean isPullBackClick(MenuOptionClicked event)
 	{
@@ -1132,7 +1557,37 @@ public class BloodwoodHeroPlugin extends Plugin
 		}
 
 		NPC npc = event.getMenuEntry().getNpc();
-		return npc != null && npc == axeClickbox;
+		if (npc == null)
+		{
+			return false;
+		}
+
+		// Which tree's clickbox this is. Clicking one is as much a statement of the tree
+		// being worked as clicking the trunk, because a pull-back is spent at the tree it
+		// was drawn at - there is no carrying it to another one. So a click on a different
+		// tree's clickbox switches to that tree rather than being ignored, which is what
+		// used to happen: the clickbox was identified by standing on the player's tile, so
+		// another tree's registered as nothing at all and the track stayed where it was
+		// while the player was certain they had moved it.
+		for (Map.Entry<Integer, NPC> entry : clickboxByTree.entrySet())
+		{
+			if (entry.getValue() != npc)
+			{
+				continue;
+			}
+
+			int treeId = entry.getKey();
+			if (treeId != requestedTreeId)
+			{
+				requestedTreeId = treeId;
+				beatAnchorTick = -1;
+				resolveActiveTree();
+			}
+			lastInteractionTick = client.getTickCount();
+			return true;
+		}
+
+		return false;
 	}
 
 	/**
@@ -1212,77 +1667,193 @@ public class BloodwoodHeroPlugin extends Plugin
 	}
 
 	/**
-	 * Starts the beat from a pull-back when there is no live cycle to follow.
+	 * Writes out what the plugin believes about every tree, so a wrong label can be
+	 * traced back to the reading it was built from.
 	 *
-	 * <p>Without this nothing can be drawn until the first chop completes, which is the
-	 * one cycle a new player most needs drawn. A pull-back puts the chop on the tick
-	 * after, so the anchor is placed where a chop would have to have been for that to be
-	 * true. The first real chop overwrites it, so a wrong guess lasts one cycle.</p>
+	 * <p>Both halves are here on purpose. The varbits say what each tree is, and the bar
+	 * matching says which tree a figure was drawn over. A label on the wrong tree and a
+	 * label reading the wrong thing look identical on screen and have nothing in common
+	 * underneath, and only one line showing both can tell them apart.</p>
 	 */
-	private void anchorBeat(int tick)
+	/**
+	 * Drops references to NPCs the moment they leave, rather than at the next tick.
+	 *
+	 * <p>Both of these are found once a tick and drawn from every frame, which is fifty
+	 * times in between. A despawned NPC still answers for its convex hull, so for the
+	 * rest of the tick the pull-back box carried on being drawn around a clickbox that
+	 * had gone - at the tree it belonged to, while the player was walking to another one.
+	 * That is the overlay briefly pointing at the wrong place, which is worse than it
+	 * briefly pointing nowhere.</p>
+	 *
+	 * <p>Nothing has to be re-found here. The tick that follows looks for both again
+	 * anyway; this only stops the gap being filled with something untrue.</p>
+	 */
+	@Subscribe
+	public void onNpcDespawned(NpcDespawned event)
 	{
-		if (beatIsStale(tick))
+		NPC npc = event.getNpc();
+
+		if (npc == axeClickbox)
 		{
-			beatAnchorTick = tick - config.cycleTicks() + 1;
+			axeClickbox = null;
 		}
-	}
 
-	/**
-	 * Starts the cycle over from the click that began it.
-	 *
-	 * <p>A cycle always opens with the pull-backs. You cannot chop an axe you have not
-	 * drawn, so the first thing a player needs to be shown on a fresh tree is the pair of
-	 * pull-back notes, and the chop a tick later.</p>
-	 *
-	 * <p>Anchoring on the click itself produces exactly that: the next tick falls off the
-	 * anchor and is a pull-back, and the one after it closes the cycle as a chop.</p>
-	 *
-	 * <p>Needed because the anchor outlives the tree it was set on. It is only replaced
-	 * by a landed chop or cleared by a scene reload, so walking to the next tree and
-	 * clicking it carried the old tree's parity across - and whether that opened on a
-	 * pull-back or on a chop came down to which tick the last tree happened to finish
-	 * on.</p>
-	 */
-	private void restartBeat(int tick)
-	{
-		beatAnchorTick = tick;
-	}
-
-	/**
-	 * Whether the beat describes a cycle that is actually running.
-	 *
-	 * <p>An anchor from a run that has already ended is worse than no anchor at all: it
-	 * is a confident statement about which tick is which, and it is wrong.</p>
-	 */
-	private boolean beatIsStale(int tick)
-	{
-		return beatAnchorTick < 0
-			|| resuming
-			|| lastChopTick < 0
-			|| tick - lastChopTick > IDLE_TICKS;
-	}
-
-	/** Remembers which tree is being worked, and which varbit therefore speaks for it. */
-	private void setActiveTree(int objectId)
-	{
-		for (int i = 0; i < BLOODWOOD_TREES.length; i++)
+		int index = headbars.indexOf(npc);
+		if (index >= 0)
 		{
-			if (BLOODWOOD_TREES[i] == objectId)
+			headbars.remove(index);
+			if (index < headbarTrees.size())
 			{
-				if (activeTreeIndex != i)
-				{
-					// A different tree means a fresh count, but not a fresh combo: the
-					// rhythm is yours and carries from one tree to the next. The chop that
-					// re-establishes it is forgiven, since getting to the tree is not part
-					// of the rhythm.
-					treeChops = 0;
-					resuming = true;
-				}
-				activeTreeIndex = i;
-				activeTree = treesById.get(objectId);
-				return;
+				headbarTrees.remove(index);
 			}
 		}
+	}
+
+	/**
+	 * Works out which tree the player is actually at, once a tick.
+	 *
+	 * <p>Taken from where they are standing rather than from what they last clicked. A
+	 * click is a request, and everything that followed from treating it as an answer went
+	 * wrong in the same way: the clicked tree could be across the clearing, could be
+	 * walked away from without another click, could be abandoned halfway, and the track
+	 * carried on being drawn over it regardless. Patching that meant guessing when the
+	 * request had been fulfilled and when it had been given up on, and there is no
+	 * reliable signal for either.</p>
+	 *
+	 * <p>Where the player is standing needs no such guessing. Chopping is done from
+	 * against the tree, so the tree they are against is the one they are chopping, and if
+	 * they are against none of them they are chopping none of them. It cannot point at a
+	 * tree they are not at, which is the only thing that kept going wrong.</p>
+	 *
+	 * <p>The click still decides whether they asked to chop or to tap. That is a question
+	 * about intent, which only the click can answer.</p>
+	 */
+	private void updateActiveTree()
+	{
+		Player local = client.getLocalPlayer();
+		LocalPoint at = local == null ? null : local.getLocalLocation();
+
+		// Noticed here rather than anywhere else because this runs once a tick, and a
+		// position compared between frames would say "moving" at every step of a walk and
+		// "still" in between.
+		//
+		// Asked of the walk itself rather than worked out from where the player was last
+		// tick. A path has stationary ticks in it, and on one of those a comparison of
+		// tiles says "arrived" in the middle of a walk - which is what put the box back
+		// on the tree being walked away from, for the one tick before it went out of
+		// reach and the whole track vanished. A destination that is not the tile already
+		// stood on means the player is on their way somewhere, whether or not this
+		// particular tick happened to move them.
+		WorldPoint standing = local == null ? null : local.getWorldLocation();
+		LocalPoint destination = client.getLocalDestinationLocation();
+		boolean enRoute = destination != null && at != null
+			&& (destination.getSceneX() != at.getSceneX()
+				|| destination.getSceneY() != at.getSceneY());
+		moving = enRoute
+			|| (standing != null && lastPlayerPosition != null
+				&& !standing.equals(lastPlayerPosition));
+		lastPlayerPosition = standing;
+
+		resolveActiveTree();
+	}
+
+	/**
+	 * Works out which tree is being worked, from the request and where the player stands.
+	 *
+	 * <p>Separate from the tick because it has to run the moment its inputs change. The
+	 * request changes on a click, and a click arrives whenever the player makes one,
+	 * while this used to be worked out once a tick - so for the rest of that tick the
+	 * answer was the previous tree, and the overlay, which draws some fifty times in
+	 * that time, drew the chop box on it. That is the box appearing on the tree just
+	 * left for a moment before correcting itself, and no per-tick log could show it:
+	 * every reading was taken after this had run, when the two agreed again.</p>
+	 *
+	 * <p>Deliberately free of the movement bookkeeping above, which must happen once a
+	 * tick and exactly once: running that on a click would compare the player against a
+	 * position recorded moments earlier and conclude they had stopped.</p>
+	 */
+	private void resolveActiveTree()
+	{
+		Player local = client.getLocalPlayer();
+		LocalPoint at = local == null ? null : local.getLocalLocation();
+
+		// Cleared up front so that every way out of this leaves the tree and its clickbox
+		// agreeing. This runs on clicks as well as on ticks, so a stale one left behind by
+		// an early return would be drawn against for the rest of the tick.
+		axeClickbox = null;
+
+		if (at == null)
+		{
+			activeTree = null;
+			activeTreeIndex = -1;
+			return;
+		}
+
+		// The tree being worked is the tree that was clicked. Nothing else can say it, and
+		// nothing else is allowed to try: trees grow close enough together that a player
+		// stood between two of them is in reach of both, so every attempt to work it out
+		// from position has had to choose between them and has sometimes chosen wrong.
+		//
+		// Position still decides WHETHER the track is up, here and in isChopping(): it
+		// answers "has the player got there yet", which is a question about this one tree
+		// rather than a search across all of them. Only a click can answer which tree,
+		// and a click answers it exactly.
+		//
+		// So there is no fallback. If no tree has been clicked there is no tree being
+		// worked, and the honest thing to draw is nothing. A guess here is wrong often
+		// enough to be noticed and quiet enough to be hard to find.
+		GameObject best = requestedTreeId > 0 ? treesById.get(requestedTreeId) : null;
+
+		if (best == null)
+		{
+			activeTree = null;
+			activeTreeIndex = -1;
+			return;
+		}
+
+		int index = indexOf(best.getId());
+		if (index < 0)
+		{
+			activeTree = null;
+			activeTreeIndex = -1;
+			return;
+		}
+		if (index != activeTreeIndex)
+		{
+			// A different tree does not break the combo: the rhythm is yours and carries
+			// from one tree to the next. The chop that re-establishes it is forgiven,
+			// since walking there is not part of the rhythm.
+			resuming = true;
+		}
+
+		activeTreeIndex = index;
+		activeTree = best;
+
+		// The clickbox belonging to that tree, settled here so everything downstream sees
+		// one consistent pair. It is the pull-back target for this tree and no other.
+		axeClickbox = clickboxByTree.get(BLOODWOOD_TREES[index]);
+	}
+
+	/**
+	 * How many tiles the player is from the nearest tile a tree stands on, or -1 if the
+	 * tree's footprint cannot be read.
+	 *
+	 * <p>Zero while stood against it, which is where chopping happens.</p>
+	 */
+	private int footprintDistance(GameObject tree, LocalPoint from)
+	{
+		Point min = tree.getSceneMinLocation();
+		Point max = tree.getSceneMaxLocation();
+		if (min == null || max == null)
+		{
+			return -1;
+		}
+
+		int x = from.getSceneX();
+		int y = from.getSceneY();
+		int dx = Math.max(0, Math.max(min.getX() - x, x - max.getX()));
+		int dy = Math.max(0, Math.max(min.getY() - y, y - max.getY()));
+		return Math.max(dx, dy);
 	}
 
 
@@ -1338,25 +1909,39 @@ public class BloodwoodHeroPlugin extends Plugin
 		treeClicksLastTick = treeClicksThisTick;
 		selfClicksThisTick = 0;
 		treeClicksThisTick = 0;
+		selfHitsThisTick = 0;
+		treeHitsThisTick = 0;
 		pullBackFractionLastTick = pullBackFraction;
 		pullBackFraction = -1;
 
 		updateAxeClickbox();
+		updateActiveTree();
+
+		// A beat only means anything while chops keep landing on it. Once the player has
+		// stalled for longer than the track survives - notes missed, walked off, stopped
+		// to read something - the cycle it describes is not the one they will come back
+		// on, so it is dropped and the track asks for a fresh pair instead of alternating
+		// around a cadence nobody is keeping.
+		int lastOnBeat = Math.max(lastChopTick, beatAnchorTick);
+		if (hasBeat() && lastOnBeat >= 0 && client.getTickCount() - lastOnBeat > IDLE_TICKS)
+		{
+			beatAnchorTick = -1;
+		}
+
+		// And the moment the track goes down, whatever took it down - walking off, the
+		// tree running out, the axe going away. Whatever cadence was being kept belonged
+		// to that stretch of chopping and does not survive it, so coming back starts from
+		// the beginning rather than resuming a cycle the player has stepped out of.
+		boolean choppingNow = isChopping();
+		if (wasChopping && !choppingNow)
+		{
+			beatAnchorTick = -1;
+		}
+		wasChopping = choppingNow;
 
 		// Told to the ping thread here, on the tick, because that thread cannot look at
 		// the scene itself.
 		atBloodwoods = !treesById.isEmpty();
-
-		// Keep the reference fresh: trees respawn as they regrow, so the object captured
-		// at click time goes stale while the id it was found by does not.
-		if (activeTreeIndex >= 0)
-		{
-			GameObject tree = treesById.get(BLOODWOOD_TREES[activeTreeIndex]);
-			if (tree != null)
-			{
-				activeTree = tree;
-			}
-		}
 
 		int tick = client.getTickCount();
 		for (int i = 0; i < CHOPPING_PROGRESS.length; i++)
@@ -1382,6 +1967,10 @@ public class BloodwoodHeroPlugin extends Plugin
 				continue;
 			}
 
+			// The varbit's raw value, which is not yet understood: it climbs far past any
+			// plausible chop count, so it is not a tally of chops and must not be read as
+			// one. Logged so its real shape can be seen - the step each chop adds, and
+			// what it stands at when the tree finally opens.
 			// And only while it is actually being chopped. Tapping and collecting move
 			// this varbit about as the tree resets, and a chop counted there would start
 			// the beat and raise the track over a cycle that is not happening. The stage
@@ -1393,15 +1982,30 @@ public class BloodwoodHeroPlugin extends Plugin
 				continue;
 			}
 
+			// Only a rise is a chop. A fall is the tree resetting to be started again,
+			// which needs nothing done about it: the progress shown comes from the varbit
+			// itself, and the combo is a property of your rhythm rather than of the tree,
+			// so it survives.
 			if (value > previous)
 			{
+				chopsDone[i]++;
+
+				// What one chop is worth, which is the axe speaking. The chop that opens
+				// the tree is clamped so it lands exactly on the target, so it is left
+				// out: counting it would drag the average below what the axe really
+				// does and overstate how many chops are left.
+				if (value < CHOP_PROGRESS_TARGET)
+				{
+					stepSum += value - previous;
+					stepCount++;
+				}
+
 				onChop(tick);
 			}
 			else if (value < previous)
 			{
-				// The tree reset, so it is being started again. The combo is a property of
-				// your rhythm rather than of the tree, so it survives.
-				treeChops = 0;
+				// The tree has opened and gone back to nothing, so the count starts again.
+				chopsDone[i] = 0;
 			}
 		}
 
@@ -1429,7 +2033,6 @@ public class BloodwoodHeroPlugin extends Plugin
 	 */
 	private void onChop(int tick)
 	{
-		treeChops++;
 		totalChops++;
 
 		// The swing animation is what the effects are timed to, but it is read from an
@@ -1461,7 +2064,7 @@ public class BloodwoodHeroPlugin extends Plugin
 			return;
 		}
 
-		if (since == config.cycleTicks())
+		if (since == CYCLE_TICKS)
 		{
 			combo++;
 			lastJudgement = BloodwoodJudgement.fromOffset(pendingClickOffset);
@@ -1508,10 +2111,67 @@ public class BloodwoodHeroPlugin extends Plugin
 		{
 			return;
 		}
-		if (Text.removeTags(event.getMessage()).toLowerCase().contains(PULL_BACK_FAILED))
+		String message = Text.removeTags(event.getMessage()).toLowerCase();
+		if (message.contains(PULL_BACK_FAILED) || message.contains(HELD_TOO_LONG))
 		{
+			// The chop is taken on trust when it is clicked, late or not, because the
+			// game accepts a late one and waiting to be sure would cost the snap that
+			// makes the feedback worth having. This is the game saying that particular
+			// one was not accepted - the axe was never drawn back, or was left too long -
+			// so the optimistic hit is taken back off and the miss put up in its place.
+			// Correcting on the game's own word beats guessing a deadline for it.
+			chopHitMillis = -1;
+			chopMissMillis = System.currentTimeMillis();
 			registerMiss(client.getTickCount());
+
+			// And the cycle is over, not merely marked wrong. A failed chop leaves the
+			// axe undrawn, so the next thing the tree wants is a fresh pair - exactly
+			// what it wanted before the first chop of all. Dropping the beat puts the
+			// track back into asking for one, with blue notes falling every tick, rather
+			// than carrying on alternating around a cycle that is no longer running and
+			// showing a red note for a chop that cannot be taken.
+			beatAnchorTick = -1;
 		}
+
+		// The game saying a tree has almost bled out is worth hearing, but it is not the
+		// question the label answers. The label says "this tap finishes it", which is a
+		// statement about a tap the player asked for - so it is raised by the click and
+		// taken back by the game refusing that click, and by nothing else.
+		//
+		// Marking the tree here is what made the word disappear and the figure turn green
+		// on its own as the sap ran down, with no tap clicked at all: the message arrives
+		// because the tree is nearly empty, not because anyone did anything about it.
+		if (activeTreeIndex >= 0 && message.contains(TREE_ALMOST_EMPTY))
+		{
+		}
+
+		// The game refusing a tap, whether or not that tap was one the label cared about.
+		// Logged for every refusal so the rule behind it can be measured: the bar reading
+		// at the click that was turned down is one side of the threshold, and the reading
+		// at the click that finally works is the other.
+		if (isTapRefusal(message))
+		{
+			// And the mark put up on the strength of that click has to come back down,
+			// since the click did nothing at all.
+			if (pendingTapTree >= 0)
+			{
+				finalTapClicked.remove(pendingTapTree);
+				pendingTapTree = -1;
+			}
+		}
+	}
+
+	/**
+	 * Whether a game message is the tree refusing a tap.
+	 *
+	 * <p>One sentence, taken from the game rather than guessed at. The speculative
+	 * alternatives this replaces - "too soon", "already", "again yet" - matched nothing,
+	 * which is the trouble with guessing at wording: a check that never fires looks
+	 * exactly like a case that never happens.</p>
+	 */
+	private boolean isTapRefusal(String message)
+	{
+		return message.contains(WOUND_NOT_NEEDED);
 	}
 
 	private void registerMiss(int tick)
@@ -1630,12 +2290,55 @@ public class BloodwoodHeroPlugin extends Plugin
 	 * in the same state as one waiting to be chopped, so state alone put the track back
 	 * up the moment a bucket was collected - before anything had been chopped at all.</p>
 	 */
-	public boolean isChopping()
+	/**
+	 * Whether the player has actually got to the tree they asked for.
+	 *
+	 * <p>Separate from {@link #isChopping()} because the two answer different questions.
+	 * Chopping says the track belongs on this tree; this says the player is standing
+	 * where the chopping happens. The boxes want the first - they are landmarks and
+	 * should be visible on the way - while the notes want the second, because a note is a
+	 * claim about when to click and there is nothing to click until you arrive.</p>
+	 */
+	public boolean isAtActiveTree()
 	{
-		if (!chopIntent || !isActiveTreeChoppable())
+		if (activeTree == null || moving)
 		{
 			return false;
 		}
+
+		Player local = client.getLocalPlayer();
+		LocalPoint at = local == null ? null : local.getLocalLocation();
+		if (at == null)
+		{
+			return false;
+		}
+
+		int distance = footprintDistance(activeTree, at);
+		return distance >= 0 && distance <= ARRIVAL_DISTANCE;
+	}
+
+	public boolean isChopping()
+	{
+		// Live on the tree last clicked, from the moment it is clicked. Waiting for the
+		// player to arrive meant the track appeared only after the walk, so the first
+		// cycle at a new tree was the one with no notes on it - the one most worth
+		// having them. There is no longer any risk in showing it early, because the tree
+		// is named by the click rather than worked out from where the player stands: the
+		// notes appear on the tree being walked to, which is the tree they describe.
+		//
+		// No test for standing still or being in range, and none for the clickbox either.
+		// Every tree carries a clickbox at all times, so its presence says nothing about
+		// whether anyone is chopping - it was a usable signal only while the clickbox was
+		// mistakenly thought to belong to the player.
+		if (activeTree == null || activeTreeIndex < 0 || !isActiveTreeChoppable())
+		{
+			return false;
+		}
+
+		// What does end it: the tree ceasing to want chopping, which the stage above
+		// covers, and the player going quiet, which this does. Between them a tapped or
+		// collected tree drops the track while a tree being worked keeps it, without
+		// needing to know which click did what.
 		int tick = client.getTickCount();
 		return (lastChopTick >= 0 && tick - lastChopTick <= IDLE_TICKS)
 			|| (lastInteractionTick >= 0 && tick - lastInteractionTick <= IDLE_TICKS);
@@ -1688,7 +2391,13 @@ public class BloodwoodHeroPlugin extends Plugin
 		{
 			return BloodwoodStage.CHOP;
 		}
-		if (sap[index] > 0)
+
+		// Read now rather than from the figure cached for display. That figure is taken
+		// once a tick and the overlay draws fifty times in one, so for up to a whole tick
+		// after a tree changes step the stage still describes the step before it: the
+		// track stayed hidden into a chop that had already started, and showed itself
+		// during a tap that had already begun. Neither is a tick the player cannot see.
+		if (client.getVarbitValue(BLEEDING_PROGRESS[index]) > 0)
 		{
 			return BloodwoodStage.TAPPING;
 		}
@@ -1746,8 +2455,43 @@ public class BloodwoodHeroPlugin extends Plugin
 		}
 
 		int left = sap[index];
-		if (left > 0 && left <= TAP_YIELD)
+		int barRatio = -1;
+		int barScale = -1;
+		for (NPC bar : headbars)
 		{
+			if (getTreeIdForHeadbar(bar) == id)
+			{
+				// Raw rather than the fraction, because the threshold is likely to be a
+				// whole number of bar units and a float would round the answer away.
+				barRatio = bar.getHealthRatio();
+				barScale = bar.getHealthScale();
+				break;
+			}
+		}
+
+		pendingTapBarRatio = barRatio;
+		pendingTapBarScale = barScale;
+		lastTapClickTree = id;
+
+		// Whether this click can land at all. A wound still open refuses another tap, so
+		// marking the tree would only have to be taken back a moment later when the game
+		// says so - and a word that disappears and comes back is worse than one that
+		// never moved. Worked out before acting rather than corrected afterwards.
+		boolean woundOpen = barScale > 0
+			&& barRatio > barScale * RETAP_BAR_THRESHOLD;
+
+		if (left > 0 && left <= TAP_YIELD && !woundOpen)
+		{
+			// Taken as done the moment it is clicked. A tap of this size finishes the
+			// tree, so the word TAP is already stale advice - it is asking for something
+			// the player has just done.
+			//
+			// Waiting for the tree to prove it was what went wrong before: the proof is a
+			// bucket moving or the sap figure falling, and neither arrives promptly, so
+			// the intention timed out and the word stayed up through the whole drain.
+			// Acting on the click and undoing it if the game complains is both quicker
+			// and more honest, and it is the same bargain the chop side makes.
+			finalTapClicked.add(id);
 			pendingTapTree = id;
 			pendingTapIndex = index;
 			pendingTapSap = left;
@@ -1875,12 +2619,18 @@ public class BloodwoodHeroPlugin extends Plugin
 		{
 			return null;
 		}
-		return delta % config.cycleTicks() == 0 ? BloodwoodBeat.CHOP : BloodwoodBeat.PULL_BACK;
+		return delta % CYCLE_TICKS == 0 ? BloodwoodBeat.CHOP : BloodwoodBeat.PULL_BACK;
+	}
+
+	/** Whether a beat has been established from a landed chop yet. */
+	public boolean hasBeat()
+	{
+		return beatAnchorTick >= 0;
 	}
 
 	/** The tick the next chop is due on. */
 	public int getNextChopTick()
 	{
-		return beatAnchorTick < 0 ? -1 : beatAnchorTick + config.cycleTicks();
+		return beatAnchorTick < 0 ? -1 : beatAnchorTick + CYCLE_TICKS;
 	}
 }

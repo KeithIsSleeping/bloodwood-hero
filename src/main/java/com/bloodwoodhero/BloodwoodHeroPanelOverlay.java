@@ -109,7 +109,7 @@ class BloodwoodHeroPanelOverlay extends OverlayPanel
 		comboLine.setRightColor(plugin.getComboColor());
 
 		bestLine.setRight(plugin.getBestCombo() + "x");
-		chopsLine.setRight(plugin.getTreeChops() + "/" + config.chopsPerTree());
+		chopsLine.setRight(plugin.getTreeChops() + "/" + plugin.getChopsPerTree());
 
 		// Shown with the ping it is derived from, so the figure can be sanity-checked
 		// without opening the settings: the window is the whole tick less the round trip,

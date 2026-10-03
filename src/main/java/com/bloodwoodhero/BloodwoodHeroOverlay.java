@@ -35,11 +35,14 @@ import java.awt.Paint;
 import java.awt.Rectangle;
 import java.awt.RenderingHints;
 import java.awt.Shape;
+import java.awt.Stroke;
+import java.awt.geom.Area;
 import java.awt.geom.Path2D;
 import java.awt.geom.PathIterator;
 import java.awt.geom.Point2D;
 import java.awt.geom.RoundRectangle2D;
 import java.text.NumberFormat;
+import java.util.HashMap;
 import java.util.Map;
 import javax.inject.Inject;
 import net.runelite.api.Client;
@@ -78,6 +81,32 @@ import net.runelite.client.ui.overlay.OverlayPosition;
  */
 class BloodwoodHeroOverlay extends Overlay
 {
+	/**
+	 * The last box measured for each tree, and where that tree was when it was measured.
+	 *
+	 * <p>The clickbox leaves the scene for a tick as one tree hands over to the next, and
+	 * both boxes are measured from it, so without this the whole track drops out mid-step
+	 * and comes back - which is the jarring part of switching trees.</p>
+	 *
+	 * <p>The tree's position is kept alongside the box so that the held box can be moved
+	 * with it. A remembered screen rectangle on its own goes stale the instant the camera
+	 * or the player moves, which is what made earlier attempts snap; shifted by however
+	 * far its tree has travelled on screen since, it stays glued to the tree it belongs
+	 * to and moves exactly as the scene does.</p>
+	 */
+	private final Map<Integer, Rectangle> heldBox = new HashMap<>();
+	private final Map<Integer, java.awt.Point> heldTreeAt = new HashMap<>();
+	private final Map<Integer, Integer> heldTick = new HashMap<>();
+
+	/**
+	 * How long a held box stays usable.
+	 *
+	 * <p>The gap is a single tick in practice. This is a little more than that so a slow
+	 * frame cannot expose it, and short enough that a tree genuinely finished with stops
+	 * being drawn almost at once.</p>
+	 */
+	private static final int HOLD_TICKS = 3;
+
 	/** Ticks the grade call-out and the milestone shout each last. */
 	private static final double JUDGEMENT_TICKS = 2.0;
 	private static final double CALLOUT_TICKS = 3.0;
@@ -91,6 +120,10 @@ class BloodwoodHeroOverlay extends Overlay
 	 */
 	private static final double HIT_TICKS = 0.5;
 	private static final double HIT_STREAK_REACH = 0.55;
+
+	/** How long the box stays red after being clicked with nothing in it. */
+	private static final double MISS_TICKS = 0.6;
+	private static final Color MISS = new Color(255, 70, 70);
 
 	/** How long the pulse runs, where its wave starts, and how far it reaches. */
 	private static final double PULSE_TICKS = 1.8;
@@ -128,6 +161,33 @@ class BloodwoodHeroOverlay extends Overlay
 
 	/** Smallest box worth drawing against; below this the target is too far to read. */
 	private static final int MIN_BOX_HEIGHT = 6;
+
+	/**
+	 * The gap kept between the two boxes, and the narrowest the chop box may be trimmed
+	 * to before it stops being worth drawing.
+	 *
+	 * <p>Both exist for the same moment: the camera swinging the tree round behind the
+	 * player, where the two targets would otherwise be drawn on top of each other.</p>
+	 */
+	private static final int BOX_GAP = 4;
+	private static final int MIN_CHOP_BOX_WIDTH = 12;
+
+	/** How faint the landmark outline on a tree you are not working is. */
+	private static final int INACTIVE_OUTLINE_ALPHA = 48;
+
+	/**
+	 * The character's outline colour: a deep, saturated blue at full strength.
+	 *
+	 * <p>A colour of its own rather than the track's shade dimmed. Dimming toward black
+	 * was tried and made it harder to see, not easier - the scene is dark, so a darkened
+	 * colour loses contrast against it rather than gaining any.</p>
+	 */
+	private static final Color PLAYER_OUTLINE_COLOR = new Color(40, 90, 255);
+	private static final int PLAYER_OUTLINE_ALPHA = 255;
+
+	/** How long the wrong-target line stays up, and how big it is drawn. */
+	private static final long WRONG_TARGET_MILLIS = 1200;
+	private static final float WRONG_TARGET_FONT_SIZE = 14f;
 
 	/** Corner radius of a window, and the length of the sight marks either side of it. */
 	private static final int CORNER = 6;
@@ -250,13 +310,86 @@ class BloodwoodHeroOverlay extends Overlay
 			drawSapCounts(graphics, tree, treeHull);
 		}
 
-		if (!config.showWhenIdle() && !plugin.isChopping())
+		// No global bail-out here. Every tree's boxes are drawn independently below, so
+		// one tree's clickbox being briefly unreadable must not take the whole interface
+		// down with it - which is what a single early return did: a blink in the NPC
+		// list blanked everything for a tick and brought it all back, right at the moment
+		// of a tree switch when the player is most reliant on it.
+
+		// Not gated on chopping any more. The placeholders exist precisely to be there
+		// before you arrive, so dropping them the moment you step away from a tree takes
+		// away the thing they were added for: walking between trees is exactly when you
+		// want to see where the next pair will be.
+
+		// Two separate questions. The boxes are drawn whenever the track belongs to this
+		// tree, including the whole walk over to it, so they travel with the player
+		// rather than vanishing and reappearing.
+		//
+		// The notes need more than that: the player has to be chopping, and to have
+		// arrived. Asking only whether the boxes are shown let the idle setting bring the
+		// notes with them, so standing at a tree doing nothing ran the primer for ever -
+		// and that setting promises the boxes, not a rhythm to follow.
+		boolean shown = plugin.isChopping() || config.showWhenIdle();
+		boolean live = plugin.isChopping() && plugin.isAtActiveTree();
+
+		// Shown whenever the track is, which means while chopping and while crossing to
+		// the next tree - both the moments you are deciding where to go. They go only
+		// when the track does, with chopping finished altogether.
+		if (config.showClickboxes() && shown)
+		{
+			for (GameObject other : plugin.getTreesById().values())
+			{
+				if (other != null && other != tree)
+				{
+					drawInactiveOutline(graphics, other);
+				}
+			}
+		}
+
+		Rectangle pullBox = drawTrack(graphics, tree, plugin.getAxeClickbox(), shown, live);
+		if (pullBox == null)
 		{
 			return null;
 		}
 
-		NPC axe = plugin.getAxeClickbox();
-		Rectangle clickbox = pullBackBox(axe == null ? null : axe.getConvexHull());
+		drawGroundPulse(graphics, tree, treeHull);
+		drawJudgement(graphics);
+
+		if (config.showCombo())
+		{
+			drawCombo(graphics, pullBox);
+		}
+		return null;
+	}
+
+	/**
+	 * One tree's pair of boxes, with or without the notes falling onto them.
+	 *
+	 * @param withNotes whether this is the tree being chopped, and so the one whose
+	 *                  timing is known
+	 * @return the pull-back box, or null if this tree has nothing drawable
+	 */
+	private Rectangle drawTrack(Graphics2D graphics, GameObject tree, NPC axe,
+		boolean shown, boolean withNotes)
+	{
+		if (tree == null || !shown)
+		{
+			return null;
+		}
+
+		Shape treeHull = tree.getConvexHull();
+		if (treeHull == null)
+		{
+			return null;
+		}
+
+		Shape axeHull = axe == null ? null : axe.getConvexHull();
+
+		// Measured directly whenever there is something to measure, so while chopping the
+		// box is the clickbox and moves exactly as the scene does.
+		Rectangle clickbox = pullBackBox(axeHull);
+		clickbox = holdBox(tree, treeHull, clickbox);
+
 		if (clickbox == null)
 		{
 			return null;
@@ -272,26 +405,82 @@ class BloodwoodHeroOverlay extends Overlay
 		Rectangle pullBox = new Rectangle(clickbox.x, clickbox.y, clickbox.width, windowHeight);
 		Rectangle chopBox = chopBox(pullBox, treeHull);
 
+		// The real click targets, under the timing boxes that stand in for them. The
+		// boxes are tidy rectangles in fixed places, which is what makes them readable as
+		// a track; these are the awkward shapes the game actually tests a click against.
+		//
+		// Before a chop has landed there is no beat, so which tick is a pull-back and
+		// which is a chop is unknown. Where the window sits inside a tick is not, and any
+		// tick is one the player may start a pull-back in - so the pull-back notes fall
+		// on every tick until a chop settles the question, and the chop lane stays empty
+		// because its timing genuinely is not known yet.
+		boolean noBeat = !plugin.hasBeat();
+
+		if (!withNotes)
+		{
+			// On the way there: the real boxes, in their real place, with nothing falling
+			// in them yet. They are the same boxes that will be clicked on arrival, so
+			// they travel with the player and settle rather than appearing from nothing -
+			// and holding the notes back until the player has actually arrived is what
+			// stops the track trying to animate a rhythm onto a box that is still sliding
+			// across the screen.
+			drawTarget(graphics, pullBox, config.pullBackColor(), false);
+			if (chopBox != null)
+			{
+				drawTarget(graphics, chopBox, config.chopColor(), false);
+			}
+			return pullBox;
+		}
+
 		drawTarget(graphics, pullBox, config.pullBackColor(), false);
-		drawLines(graphics, pullBox, tickHeight, BloodwoodBeat.PULL_BACK, config.pullBackColor());
-		drawHitFlash(graphics, pullBox, config.pullBackColor(), BloodwoodBeat.PULL_BACK,
-			tickHeight);
 
 		if (chopBox != null)
 		{
 			drawTarget(graphics, chopBox, config.chopColor(), true);
-			drawLines(graphics, chopBox, tickHeight, BloodwoodBeat.CHOP, config.chopColor());
-			drawHitFlash(graphics, chopBox, config.chopColor(), BloodwoodBeat.CHOP, tickHeight);
 		}
 
-		drawGroundPulse(graphics, tree, treeHull);
-		drawJudgement(graphics);
-
-		if (config.showCombo())
+		// Where your own character can take a click. Drawn after the boxes so the boxes
+		// cannot paint over it, and outline only - a wash here tints whatever it is laid
+		// across, which is trunk and ground rather than a target of its own.
+		//
+		// Only the part outside the pull-back box. Inside it the character IS the target,
+		// drawn and labelled as such; what is worth seeing is the reach beyond the box,
+		// which is the part that takes clicks meant for the wood.
+		if (config.showClickboxes() && withNotes)
 		{
-			drawCombo(graphics, pullBox);
+			Player local = client.getLocalPlayer();
+			drawPlayerOutline(graphics, outside(local == null ? null : local.getConvexHull(),
+				pullBox));
 		}
-		return null;
+
+		drawLines(graphics, pullBox, tickHeight, BloodwoodBeat.PULL_BACK,
+			config.pullBackColor(), noBeat);
+		drawHitFlash(graphics, pullBox, config.pullBackColor(), BloodwoodBeat.PULL_BACK,
+			tickHeight);
+		drawMissFlash(graphics, pullBox, BloodwoodBeat.PULL_BACK);
+
+		if (chopBox != null)
+		{
+			if (!noBeat)
+			{
+				drawLines(graphics, chopBox, tickHeight, BloodwoodBeat.CHOP,
+					config.chopColor(), false);
+			}
+			drawHitFlash(graphics, chopBox, config.chopColor(), BloodwoodBeat.CHOP,
+				tickHeight);
+			drawMissFlash(graphics, chopBox, BloodwoodBeat.CHOP);
+
+			// Said out loud, because it is the one failure the player cannot see the
+			// cause of: the click was on target and still did the wrong thing, because
+			// the axe was in front of the wood at that moment. Without this it reads as
+			// the chop box being broken.
+			if (plugin.pullBackHitChopBox(chopBox, WRONG_TARGET_MILLIS))
+			{
+				drawWrongTarget(graphics, chopBox);
+			}
+		}
+
+		return pullBox;
 	}
 
 	/**
@@ -300,6 +489,186 @@ class BloodwoodHeroOverlay extends Overlay
 	 * <p>Taken from the clickbox rather than from the model, because the clickbox is what
 	 * a click actually has to land in.</p>
 	 */
+	/**
+	 * Carries a tree's box across the tick its clickbox is missing.
+	 *
+	 * <p>A measured box is simply returned, and remembered along with where its tree was
+	 * at the time. When there is nothing to measure, the remembered box is returned
+	 * shifted by however far the tree has moved on screen since - so it travels with the
+	 * tree rather than hanging where the camera used to be.</p>
+	 */
+	private Rectangle holdBox(GameObject tree, Shape treeHull, Rectangle measured)
+	{
+		int treeId = tree.getId();
+		int tick = client.getTickCount();
+		java.awt.Point treeAt = treeAnchor(tree);
+		if (treeAt == null)
+		{
+			return measured;
+		}
+
+		if (measured != null)
+		{
+			heldBox.put(treeId, measured);
+			heldTreeAt.put(treeId, treeAt);
+			heldTick.put(treeId, tick);
+			return measured;
+		}
+
+		Integer when = heldTick.get(treeId);
+		Rectangle held = heldBox.get(treeId);
+		java.awt.Point was = heldTreeAt.get(treeId);
+		if (when == null || held == null || was == null || tick - when > HOLD_TICKS)
+		{
+			return null;
+		}
+
+		return new Rectangle(held.x + (treeAt.x - was.x), held.y + (treeAt.y - was.y),
+			held.width, held.height);
+	}
+
+	/**
+	 * Where a tree is on screen, cheaply.
+	 *
+	 * <p>Its canvas point rather than its hull, because this is only ever used to measure
+	 * how far the tree has moved, and projecting a whole model to answer that would cost
+	 * more than everything it is used for. The hull is reserved for the one tree whose
+	 * shape is actually being drawn against.</p>
+	 */
+	private static java.awt.Point treeAnchor(GameObject tree)
+	{
+		Point at = tree.getCanvasLocation();
+		return at == null ? null : new java.awt.Point(at.getX(), at.getY());
+	}
+
+	/**
+	 * The faint outline of a tree you are not working, where its boxes would be.
+	 *
+	 * <p>Taken from that tree's own clickbox, live, every frame. Every tree has one while
+	 * you are chopping, so these are real boxes in their real places rather than anything
+	 * remembered or inferred - and they hold their last position only for the moment the
+	 * clickboxes leave the scene during a switch.</p>
+	 *
+	 * <p>Outlines only, at a fraction of the live track's weight. It is a landmark saying
+	 * "the targets are here" - clicking the tree brings the real pair up in the same
+	 * place.</p>
+	 */
+	private void drawInactiveOutline(Graphics2D graphics, GameObject tree)
+	{
+		// Measured from this tree's own clickbox, which exists while you are chopping
+		// anywhere in the grove - every tree carries one. Reading a remembered position
+		// instead was the bug: only the tree being worked ever recorded one, so the
+		// others had nothing to show, or showed a reading left over from when they were
+		// last the active tree and so drew nowhere near their real boxes.
+		NPC axe = plugin.getClickboxByTree().get(tree.getId());
+		Rectangle measured = axe == null ? null : pullBackBox(axe.getConvexHull());
+		if (measured != null)
+		{
+			heldBox.put(tree.getId(), measured);
+		}
+
+		// Held only across the gap where the clickboxes leave the scene, so the boxes
+		// stay put for that moment rather than blinking out, and snap to the new reading
+		// when they return.
+		Rectangle clickbox = measured != null ? measured : heldBox.get(tree.getId());
+		if (clickbox == null)
+		{
+			return;
+		}
+
+		// Both boxes, laid out exactly as the live pair is, so clicking this tree brings
+		// the real ones up in the same places rather than somewhere near them.
+		int windowHeight = Math.max(2,
+			(int) Math.round(clickbox.height * plugin.effectiveWindow()));
+		Rectangle pullBox = new Rectangle(clickbox.x, clickbox.y, clickbox.width,
+			windowHeight);
+
+		graphics.setStroke(TARGET_EDGE);
+		outlineBox(graphics, pullBox, config.pullBackColor());
+
+		Shape treeShape = tree.getConvexHull();
+		if (treeShape != null)
+		{
+			Rectangle chop = chopBox(pullBox, treeShape);
+			if (chop != null)
+			{
+				outlineBox(graphics, chop, config.chopColor());
+			}
+		}
+	}
+
+	private void outlineBox(Graphics2D graphics, Rectangle box, Color colour)
+	{
+		graphics.setColor(alpha(colour, INACTIVE_OUTLINE_ALPHA));
+		graphics.draw(new RoundRectangle2D.Float(box.x, box.y, box.width, box.height,
+			CORNER, CORNER));
+	}
+
+	/**
+	 * The part of a shape lying outside a rectangle, or null if none of it does.
+	 *
+	 * <p>Used to drop the half of the character already inside the pull-back box, which
+	 * is the target itself and says nothing by being outlined twice.</p>
+	 */
+	private static Shape outside(Shape hull, Rectangle exclude)
+	{
+		if (hull == null)
+		{
+			return null;
+		}
+		if (exclude == null || exclude.isEmpty())
+		{
+			return hull;
+		}
+
+		Area area = new Area(hull);
+		area.subtract(new Area(exclude));
+		return area.isEmpty() ? null : area;
+	}
+
+	/** The character's clickable reach, outlined in its own deep blue. */
+	private void drawPlayerOutline(Graphics2D graphics, Shape shape)
+	{
+		if (shape == null)
+		{
+			return;
+		}
+
+		Stroke oldStroke = graphics.getStroke();
+		graphics.setStroke(new BasicStroke(1f));
+		graphics.setColor(alpha(PLAYER_OUTLINE_COLOR, PLAYER_OUTLINE_ALPHA));
+		graphics.draw(shape);
+		graphics.setStroke(oldStroke);
+	}
+
+	/**
+	 * Tells the player their click hit the axe rather than the tree.
+	 *
+	 * <p>Drawn over the chop box in the character's own colour, so the warning and the
+	 * thing that caused it are plainly the same thing. It says what to do rather than
+	 * what went wrong: mid-rhythm there is no time to read an explanation, and the
+	 * instruction is the useful half of it.</p>
+	 *
+	 * <p>The box is outlined in that colour too for the moment it lasts, which says which
+	 * of the two overlapping targets took the click.</p>
+	 */
+	private void drawWrongTarget(Graphics2D graphics, Rectangle chopBox)
+	{
+		Stroke oldStroke = graphics.getStroke();
+		graphics.setStroke(TARGET_EDGE);
+		graphics.setColor(alpha(PLAYER_OUTLINE_COLOR, 220));
+		graphics.draw(new RoundRectangle2D.Float(chopBox.x, chopBox.y, chopBox.width,
+			chopBox.height, CORNER, CORNER));
+		graphics.setStroke(oldStroke);
+
+		graphics.setFont(font(graphics, WRONG_TARGET_FONT_SIZE));
+		FontMetrics metrics = graphics.getFontMetrics();
+		String text = plugin.getWrongTargetShout();
+		int x = chopBox.x + (chopBox.width - metrics.stringWidth(text)) / 2;
+		int y = chopBox.y - metrics.getDescent();
+		drawLabel(graphics, x, y, text, PLAYER_OUTLINE_COLOR);
+	}
+
 	private Rectangle pullBackBox(Shape hull)
 	{
 		if (hull == null)
@@ -344,22 +713,58 @@ class BloodwoodHeroOverlay extends Overlay
 		int centreX = crossingCentre(hull, pullBox.y + pullBox.height / 2,
 			bounds.x + bounds.width / 2);
 
-		return new Rectangle(centreX - pullBox.width / 2, pullBox.y,
-			pullBox.width, pullBox.height);
+		int left = centreX - pullBox.width / 2;
+		int right = left + pullBox.width;
+
+		// Pull the near edge clear of the pull-back box when the camera has swung the
+		// tree round behind the player and the two land on the same pixels. Trimmed
+		// rather than moved: the box is a click target as well as a timing one, so
+		// sliding it off the tree to make room would have it pointing at bare ground.
+		// Narrower and still on the wood beats the right width in the wrong place.
+		if (right > pullBox.x - BOX_GAP && left < pullBox.x + pullBox.width + BOX_GAP)
+		{
+			if (centreX >= pullBox.x + pullBox.width / 2)
+			{
+				left = pullBox.x + pullBox.width + BOX_GAP;
+			}
+			else
+			{
+				right = pullBox.x - BOX_GAP;
+			}
+		}
+
+		// Below a usable width there is no honest target left to draw, and the tree is
+		// behind the player anyway. Better to show nothing and let them turn the camera
+		// than to draw a sliver that cannot be aimed at.
+		int width = right - left;
+		if (width < MIN_CHOP_BOX_WIDTH)
+		{
+			return null;
+		}
+
+		return new Rectangle(left, pullBox.y, width, pullBox.height);
 	}
 
 	/**
-	 * The middle of a shape at one height, found by walking its edges.
-	 *
-	 * <p>Takes every edge that straddles the line, works out where it crosses, and
-	 * returns the midpoint of the leftmost and rightmost crossings. For a convex hull
-	 * there are exactly two, so this is the exact width of the shape at that height -
-	 * the same answer an area intersection gives, without building one.</p>
+	 * The middle of a shape at one height.
 	 *
 	 * @param fallback used when the line misses the shape entirely, or when the shape is
 	 *                 not one that can be walked
 	 */
 	private static int crossingCentre(Shape shape, int y, int fallback)
+	{
+		double[] span = crossingSpan(shape, y);
+		return span == null ? fallback : (int) Math.round((span[0] + span[1]) / 2);
+	}
+
+	/**
+	 * The leftmost and rightmost crossings of a shape at one height, or null for a miss.
+	 *
+	 * <p>Takes every edge that straddles the line and works out where it crosses. For a
+	 * convex hull there are exactly two crossings, so this is the shape's exact extent at
+	 * that height - the same answer an area intersection gives, without building one.</p>
+	 */
+	private static double[] crossingSpan(Shape shape, int y)
 	{
 		double min = Double.POSITIVE_INFINITY;
 		double max = Double.NEGATIVE_INFINITY;
@@ -409,7 +814,7 @@ class BloodwoodHeroOverlay extends Overlay
 			}
 		}
 
-		return min <= max ? (int) Math.round((min + max) / 2) : fallback;
+		return min <= max ? new double[]{min, max} : null;
 	}
 
 	/** Where an edge crosses a horizontal line, or NaN if it does not reach it. */
@@ -522,8 +927,18 @@ class BloodwoodHeroOverlay extends Overlay
 	 * a tick later it has crossed to the bottom edge, so the time it overlaps the box is
 	 * exactly the time the click is accepted.</p>
 	 */
+	/**
+	 * The notes falling into one lane.
+	 *
+	 * @param everyTick draw this lane's notes on every tick rather than only on the ticks
+	 *                  the beat assigns to it. Used before a chop has established the
+	 *                  beat: which tick is a pull-back and which is a chop is not known
+	 *                  then, but where the window sits inside a tick is, and any tick is
+	 *                  a tick you may start a pull-back in. The notes are therefore
+	 *                  truthful about timing while saying nothing about phase.
+	 */
 	private void drawLines(Graphics2D graphics, Rectangle box, int tickHeight,
-		BloodwoodBeat beat, Color color)
+		BloodwoodBeat beat, Color color, boolean everyTick)
 	{
 		int tick = client.getTickCount();
 		double now = tick + plugin.getTickProgress();
@@ -536,7 +951,7 @@ class BloodwoodHeroOverlay extends Overlay
 		// Furthest first, so the imminent line is drawn over the ones behind it.
 		for (int ahead = lookahead; ahead >= 0; ahead--)
 		{
-			if (plugin.beatAt(tick + ahead) != beat)
+			if (!everyTick && plugin.beatAt(tick + ahead) != beat)
 			{
 				continue;
 			}
@@ -546,9 +961,12 @@ class BloodwoodHeroOverlay extends Overlay
 			{
 				// A note that has been struck is gone. Leaving it to carry on falling
 				// past its own burst said the click had not landed, which is the opposite
-				// of what had just happened - and left the burst looking like it was
-				// trailing behind the note rather than consuming it.
-				if (ahead == 0 && click < plugin.getClicksThisTick(beat))
+				// of what had just happened.
+				//
+				// Counted in hits, not clicks: a click that struck nothing took no note
+				// with it, and the note it missed is still falling and still the one the
+				// next click is aimed at.
+				if (ahead == 0 && click < plugin.getHitsThisTick(beat))
 				{
 					continue;
 				}
@@ -596,6 +1014,33 @@ class BloodwoodHeroOverlay extends Overlay
 			graphics.setStroke(passes[pass]);
 			graphics.drawLine(left, y, right, y);
 		}
+	}
+
+	/**
+	 * The box flashing red when it is clicked with nothing in it.
+	 *
+	 * <p>Drawn on the box rather than at the click, which is the whole point. A stray
+	 * click used to be given the same burst as a hit, placed at wherever in the tick it
+	 * landed, so it appeared as a flash at an arbitrary height with nothing under it -
+	 * indistinguishable from the track glitching. A miss is not an event with a position;
+	 * it is the lane as a whole saying there was nothing there.</p>
+	 */
+	private void drawMissFlash(Graphics2D graphics, Rectangle box, BloodwoodBeat beat)
+	{
+		double age = plugin.missAge(beat);
+		if (age < 0 || age > MISS_TICKS)
+		{
+			return;
+		}
+
+		double fade = 1 - age / MISS_TICKS;
+		fade *= fade;
+
+		graphics.setColor(alpha(MISS, (int) Math.round(90 * fade)));
+		graphics.fill(box);
+		graphics.setColor(alpha(MISS, (int) Math.round(255 * fade)));
+		graphics.setStroke(TARGET_HALO);
+		graphics.draw(box);
 	}
 
 	/**
